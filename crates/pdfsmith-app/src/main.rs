@@ -22,8 +22,19 @@ const MAX_LOD: i32 = 8;
 const TEXTURE_CAP: usize = 400;
 const ZOOM_STEP: f32 = 1.25;
 
-fn main() -> eframe::Result<()> {
+fn main() {
     env_logger::init();
+
+    // В release нет консоли: показываем панику нативным окном, иначе сбой
+    // запуска (например, отсутствие OpenGL) был бы невидим.
+    std::panic::set_hook(Box::new(|info| {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("pdfsmith — критическая ошибка")
+            .set_description(info.to_string())
+            .show();
+    }));
+
     let path = std::env::args_os().nth(1).map(PathBuf::from);
 
     let options = eframe::NativeOptions {
@@ -33,11 +44,24 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "pdfsmith",
         options,
         Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, path)))),
-    )
+    );
+
+    if let Err(e) = result {
+        // Чаще всего — не удалось создать OpenGL-контекст (нет драйверов GPU,
+        // удалённый рабочий стол, виртуалка).
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("pdfsmith — не удалось запустить окно")
+            .set_description(format!(
+                "{e}\n\nВозможные причины: нет поддержки OpenGL (драйверы видеокарты, \
+                 удалённый рабочий стол или виртуальная машина)."
+            ))
+            .show();
+    }
 }
 
 /// Ключ тайла-текстуры: (страница, поворот, LOD, столбец, строка).

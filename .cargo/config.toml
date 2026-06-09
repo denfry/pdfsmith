@@ -1,0 +1,4 @@
+# Статически линкуем runtime MSVC внутрь exe, чтобы приложение запускалось на
+# машинах без установленного Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
