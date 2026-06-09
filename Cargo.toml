@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pdfsmith-pdfium",
+    "crates/pdfsmith-engine",
+    "crates/pdfsmith-app",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Proprietary"
+authors = ["PDFsmith"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+pdfsmith-pdfium = { path = "crates/pdfsmith-pdfium" }
+pdfsmith-engine = { path = "crates/pdfsmith-engine" }
+thiserror = "2"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
