@@ -41,6 +41,10 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_title("pdfsmith"),
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: build_wgpu_setup(),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -566,6 +570,68 @@ impl ViewerApp {
                 }
             }
         });
+    }
+}
+
+/// Создаёт wgpu-устройство: сначала аппаратное (DX12/Vulkan), при отказе —
+/// программный WARP (встроен в Windows, не требует драйверов GPU). Благодаря
+/// этому приложение запускается и на машинах без видеодрайверов.
+fn build_wgpu_setup() -> eframe::egui_wgpu::WgpuSetup {
+    use eframe::wgpu;
+    use std::sync::Arc;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        ..Default::default()
+    });
+
+    // PDFSMITH_FORCE_WARP=1 принудительно выбирает программный рендер (на случай
+    // битых видеодрайверов).
+    let force_warp = std::env::var("PDFSMITH_FORCE_WARP").is_ok();
+    let adapter = pollster::block_on(async {
+        // 1. Аппаратный адаптер (DX12/Vulkan).
+        if !force_warp {
+            if let Some(a) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+            {
+                return Some(a);
+            }
+        }
+        // 2. Запасной: перечисляем адаптеры и предпочитаем программный (WARP, тип
+        //    Cpu) — он встроен в Windows и не требует видеодрайверов.
+        instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .into_iter()
+            .min_by_key(|a| match a.get_info().device_type {
+                wgpu::DeviceType::Cpu => 0u8,
+                _ => 1u8,
+            })
+    })
+    .expect("не найден ни один графический адаптер (DX12/Vulkan/WARP)");
+
+    log::info!("wgpu адаптер: {:?}", adapter.get_info());
+
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("pdfsmith"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+        },
+        None,
+    ))
+    .expect("не удалось создать графическое устройство");
+
+    eframe::egui_wgpu::WgpuSetup::Existing {
+        instance: Arc::new(instance),
+        adapter: Arc::new(adapter),
+        device: Arc::new(device),
+        queue: Arc::new(queue),
     }
 }
 

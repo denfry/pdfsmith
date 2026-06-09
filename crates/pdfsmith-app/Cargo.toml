@@ -9,7 +9,8 @@ rust-version.workspace = true
 pdfsmith-engine.workspace = true
 pdfsmith-pdfium.workspace = true
 log.workspace = true
-eframe = { version = "0.30.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.30.0", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+pollster = "0.4"
 env_logger = "0.11.10"
 rfd = { version = "0.17.2", default-features = false }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
