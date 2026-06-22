@@ -124,7 +124,7 @@ fn extract_returns_aligned_chars_and_boxes() {
     let frac = inside as f64 / non_degenerate.len() as f64;
     eprintln!("боксов в пределах страницы: {}/{} ({:.1}%)", inside, non_degenerate.len(), frac * 100.0);
     assert!(
-        frac >= 0.5,
+        frac >= 0.90,
         "лишь {:.1}% боксов в пределах страницы — координаты в неверном пространстве",
         frac * 100.0
     );
