@@ -383,6 +383,9 @@ impl Worker {
         let mut total_matches = 0usize;
         for (scanned, page) in order.into_iter().enumerate() {
             if let Ok(newer) = job_rx.try_recv() {
+                // Завершаем текущее поколение поиска, чтобы UI снял индикатор,
+                // даже если запрос отменён более свежим.
+                self.emit(Event::SearchDone { generation, total_matches });
                 return Some(newer);
             }
             let size = match self.doc.as_ref().and_then(|d| d.page_size(page)) {
