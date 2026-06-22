@@ -236,6 +236,11 @@ impl ViewerApp {
                     self.status_msg = Some(format!("Сохранено: {}", path.display()));
                 }
                 Event::Error(e) => self.error = Some(e),
+                // Search/text events handled in future tasks — ignore for now.
+                Event::SearchPage { .. }
+                | Event::SearchProgress { .. }
+                | Event::SearchDone { .. }
+                | Event::PageText { .. } => {}
             }
         }
     }

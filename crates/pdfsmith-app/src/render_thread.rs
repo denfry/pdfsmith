@@ -6,12 +6,16 @@
 //! и кладёт в кэш. Между тайлами проверяет, не пришёл ли более свежий запрос
 //! (отмена устаревших задач при движении вьюпорта).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 use eframe::egui;
 use pdfsmith_engine::disk_cache::{file_id, DiskCache, Tile};
+use pdfsmith_engine::geom::{pdf_rect_to_page_pt, union, PdfRect};
+use pdfsmith_engine::search::{search_in_chars, search_page_order};
+use pdfsmith_pdfium::text::PageText;
 use pdfsmith_pdfium::{init, Document, Page, RenderedImage};
 
 /// Сторона тайла в device-пикселях.
@@ -19,6 +23,21 @@ pub const TILE: u32 = 256;
 
 /// Длинная сторона миниатюры (обзор/миникарта) в пикселях.
 pub const THUMB_PX: f32 = 256.0;
+
+/// Опции поиска, задаваемые из UI.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindOpts {
+    pub match_case: bool,
+    pub whole_word: bool,
+}
+
+/// Одно совпадение в page-point пространстве (для подсветки и перехода).
+#[derive(Debug, Clone, Copy)]
+pub struct MatchPt {
+    pub rect: egui::Rect,
+    pub start: i32,
+    pub count: i32,
+}
 
 /// Команда из UI в рендер-поток.
 pub enum Job {
@@ -37,6 +56,17 @@ pub enum Job {
         /// Координаты тайлов (col, row) в порядке приоритета (центр первым).
         tiles: Vec<(u32, u32)>,
     },
+    /// Инкрементальный поиск по документу. `generation` отсекает устаревшие
+    /// результаты на стороне UI.
+    Search {
+        query: String,
+        opts: FindOpts,
+        start_page: usize,
+        rotation: u8,
+        generation: u64,
+    },
+    /// Извлечение текста страницы (символы + боксы в page-point) для выделения.
+    PageText { page: usize, rotation: u8 },
 }
 
 /// Событие из рендер-потока в UI.
@@ -60,6 +90,10 @@ pub enum Event {
     },
     Exported(PathBuf),
     Error(String),
+    SearchPage { generation: u64, page: usize, matches: Vec<MatchPt> },
+    SearchProgress { generation: u64, scanned: usize, total: usize },
+    SearchDone { generation: u64, total_matches: usize },
+    PageText { page: usize, rotation: u8, chars: Vec<char>, boxes: Vec<egui::Rect> },
 }
 
 pub struct RenderHandle {
@@ -84,12 +118,48 @@ fn cache_root() -> PathBuf {
     }
 }
 
+/// Переводит PDF-бокс из `pdfsmith_pdfium` в тип геометрии движка.
+fn to_pdf_rect(b: &pdfsmith_pdfium::text::RectPt) -> PdfRect {
+    PdfRect { left: b.left, bottom: b.bottom, right: b.right, top: b.top }
+}
+
+/// Находит совпадения запроса в извлечённом тексте и переводит их в page-point
+/// прямоугольники (по одному объединённому прямоугольнику на совпадение).
+pub(crate) fn build_matches(
+    pt: &PageText,
+    query: &str,
+    opts: FindOpts,
+    page_w: f32,
+    page_h: f32,
+    rotation: u8,
+) -> Vec<MatchPt> {
+    let hits = search_in_chars(&pt.chars, query, opts.match_case, opts.whole_word);
+    let mut out = Vec::with_capacity(hits.len());
+    for m in hits {
+        let end = m.start + m.len;
+        let Some(slice) = pt.boxes.get(m.start..end) else { continue };
+        let pp: Vec<_> = slice
+            .iter()
+            .map(|b| pdf_rect_to_page_pt(to_pdf_rect(b), page_w, page_h, rotation))
+            .collect();
+        if let Some(u) = union(&pp) {
+            out.push(MatchPt {
+                rect: egui::Rect::from_min_size(egui::pos2(u.x, u.y), egui::vec2(u.w, u.h)),
+                start: m.start as i32,
+                count: m.len as i32,
+            });
+        }
+    }
+    out
+}
+
 struct Worker {
     event_tx: Sender<Event>,
     ctx: egui::Context,
     doc: Option<Document>,
     disk: Option<DiskCache>,
     loaded: Option<(usize, Page)>,
+    text_cache: HashMap<usize, PageText>,
 }
 
 fn worker(
@@ -106,7 +176,7 @@ fn worker(
         return;
     }
 
-    let mut w = Worker { event_tx, ctx, doc: None, disk: None, loaded: None };
+    let mut w = Worker { event_tx, ctx, doc: None, disk: None, loaded: None, text_cache: HashMap::new() };
     let mut pending: Option<Job> = None;
 
     loop {
@@ -125,6 +195,10 @@ fn worker(
             Job::Tiles { page, rotation, lod, lod_scale, page_pt, tiles } => {
                 pending =
                     w.render_tiles(&job_rx, page, rotation, lod, lod_scale, page_pt, tiles);
+            }
+            Job::PageText { page, rotation } => w.page_text(page, rotation),
+            Job::Search { query, opts, start_page, rotation, generation } => {
+                pending = w.search(&job_rx, query, opts, start_page, rotation, generation);
             }
         }
     }
@@ -242,6 +316,7 @@ impl Worker {
                 // заменяем документ (иначе закрытие страницы произойдёт после
                 // закрытия её документа — use-after-free).
                 self.loaded = None;
+                self.text_cache.clear();
                 self.disk = Some(disk);
                 self.doc = Some(d);
                 self.emit(Event::Opened { page_sizes });
@@ -251,6 +326,83 @@ impl Worker {
                 self.emit(Event::Error(e.to_string()));
             }
         }
+    }
+
+    /// Гарантирует, что текст страницы извлечён и лежит в кэше.
+    fn ensure_text(&mut self, page: usize) -> Result<(), String> {
+        if self.text_cache.contains_key(&page) {
+            return Ok(());
+        }
+        self.ensure_loaded(page)?;
+        let pg = &self.loaded.as_ref().expect("страница загружена").1;
+        let tp = pg.text().map_err(|e| e.to_string())?;
+        let pt = tp.extract();
+        self.text_cache.insert(page, pt);
+        Ok(())
+    }
+
+    /// Извлекает текст страницы и шлёт боксы в page-point пространстве (для
+    /// выделения/копирования в UI).
+    fn page_text(&mut self, page: usize, rotation: u8) {
+        let size = match self.doc.as_ref().and_then(|d| d.page_size(page)) {
+            Some(s) => s,
+            None => return,
+        };
+        if let Err(e) = self.ensure_text(page) {
+            self.emit(Event::Error(e));
+            return;
+        }
+        let pt = self.text_cache.get(&page).expect("в кэше");
+        let chars = pt.chars.clone();
+        let boxes: Vec<egui::Rect> = pt
+            .boxes
+            .iter()
+            .map(|b| {
+                let r = pdf_rect_to_page_pt(to_pdf_rect(b), size.width_pt, size.height_pt, rotation);
+                egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h))
+            })
+            .collect();
+        self.emit(Event::PageText { page, rotation, chars, boxes });
+    }
+
+    /// Инкрементальный поиск: текущая страница первой, остальные по кругу.
+    /// Между страницами проверяет отмену (новый Job). Возвращает `Some(job)`,
+    /// если пришёл более свежий запрос.
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        &mut self,
+        job_rx: &Receiver<Job>,
+        query: String,
+        opts: FindOpts,
+        start_page: usize,
+        rotation: u8,
+        generation: u64,
+    ) -> Option<Job> {
+        let total = self.doc.as_ref().map(|d| d.page_count()).unwrap_or(0);
+        let order = search_page_order(start_page, total);
+        let mut total_matches = 0usize;
+        for (scanned, page) in order.into_iter().enumerate() {
+            if let Ok(newer) = job_rx.try_recv() {
+                return Some(newer);
+            }
+            let size = match self.doc.as_ref().and_then(|d| d.page_size(page)) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Err(e) = self.ensure_text(page) {
+                self.emit(Event::Error(e));
+                continue;
+            }
+            let pt = self.text_cache.get(&page).expect("в кэше");
+            let matches = build_matches(pt, &query, opts, size.width_pt, size.height_pt, rotation);
+            total_matches += matches.len();
+            if !matches.is_empty() {
+                self.emit(Event::SearchPage { generation, page, matches });
+            }
+            self.emit(Event::SearchProgress { generation, scanned: scanned + 1, total });
+        }
+        self.emit(Event::SearchDone { generation, total_matches });
+        None
     }
 
     /// Рендерит список тайлов. Возвращает `Some(job)`, если пришёл более свежий
@@ -332,5 +484,46 @@ impl Worker {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfsmith_pdfium::text::{PageText, RectPt};
+
+    #[test]
+    fn build_matches_maps_query_to_pagepoint_rect() {
+        // Страница 200×100. Символы "ab" с боксами рядом по горизонтали.
+        let pt = PageText {
+            chars: vec!['a', 'b'],
+            boxes: vec![
+                RectPt { left: 10.0, bottom: 20.0, right: 20.0, top: 40.0 },
+                RectPt { left: 20.0, bottom: 20.0, right: 30.0, top: 40.0 },
+            ],
+        };
+        let opts = FindOpts { match_case: false, whole_word: false };
+        let m = build_matches(&pt, "ab", opts, 200.0, 100.0, 0);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].start, 0);
+        assert_eq!(m[0].count, 2);
+        // rot0: y = H - top .. H - bottom = 60..80; x = 10..30.
+        assert_eq!(m[0].rect.min.x, 10.0);
+        assert_eq!(m[0].rect.min.y, 60.0);
+        assert_eq!(m[0].rect.width(), 20.0);
+        assert_eq!(m[0].rect.height(), 20.0);
+    }
+
+    #[test]
+    fn build_matches_empty_when_absent() {
+        let pt = PageText {
+            chars: vec!['a', 'b'],
+            boxes: vec![
+                RectPt { left: 10.0, bottom: 20.0, right: 20.0, top: 40.0 },
+                RectPt { left: 20.0, bottom: 20.0, right: 30.0, top: 40.0 },
+            ],
+        };
+        let opts = FindOpts { match_case: false, whole_word: false };
+        assert!(build_matches(&pt, "zzz", opts, 200.0, 100.0, 0).is_empty());
     }
 }
