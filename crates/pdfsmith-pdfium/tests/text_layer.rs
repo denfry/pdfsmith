@@ -100,13 +100,32 @@ fn extract_returns_aligned_chars_and_boxes() {
     assert_eq!(pt.chars.len(), pt.boxes.len(), "chars и boxes должны быть одной длины");
     assert!(!pt.chars.is_empty());
 
-    // Боксы лежат в пределах страницы (с допуском). Инженерные чертежи допускают
-    // выход за MediaBox, поэтому допуск 200 pt (≈7 cm) — достаточно чтобы поймать
-    // полностью сломанные координаты, но не ложные срабатывания на реальных файлах.
+    // Координатное пространство проверяем «по большинству»: подавляющая часть
+    // непустых боксов должна лежать в пределах страницы (±1 pt). Это доказывает,
+    // что координаты — в PDF-пунктах (а не device-пикселях/мусоре), но терпит
+    // реальные выбросы (на чертежах часть текста выходит за MediaBox).
     let size = doc.page_size(idx).expect("размер страницы");
     eprintln!("размер страницы: {}×{} pt, символов: {}", size.width_pt, size.height_pt, pt.chars.len());
-    for r in pt.boxes.iter().filter(|r| r.right > r.left || r.top > r.bottom) {
-        assert!(r.left >= -200.0 && r.right <= size.width_pt + 200.0, "бокс по X вне страницы: {r:?}");
-        assert!(r.bottom >= -200.0 && r.top <= size.height_pt + 200.0, "бокс по Y вне страницы: {r:?}");
-    }
+    let non_degenerate: Vec<_> = pt
+        .boxes
+        .iter()
+        .filter(|r| r.right > r.left && r.top > r.bottom)
+        .collect();
+    assert!(!non_degenerate.is_empty(), "нет ни одного непустого бокса символа");
+    let inside = non_degenerate
+        .iter()
+        .filter(|r| {
+            r.left >= -1.0
+                && r.right <= size.width_pt + 1.0
+                && r.bottom >= -1.0
+                && r.top <= size.height_pt + 1.0
+        })
+        .count();
+    let frac = inside as f64 / non_degenerate.len() as f64;
+    eprintln!("боксов в пределах страницы: {}/{} ({:.1}%)", inside, non_degenerate.len(), frac * 100.0);
+    assert!(
+        frac >= 0.5,
+        "лишь {:.1}% боксов в пределах страницы — координаты в неверном пространстве",
+        frac * 100.0
+    );
 }
