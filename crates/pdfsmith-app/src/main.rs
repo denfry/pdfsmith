@@ -15,7 +15,7 @@ use pdfsmith_engine::lod::lod_scale_for;
 use pdfsmith_engine::viewport::visible_tiles_center_out;
 
 mod render_thread;
-use render_thread::{spawn, Event, FindOpts, Job, MatchPt, RenderHandle, TILE};
+use render_thread::{spawn, Event, FindOpts, Job, RenderHandle, TILE};
 
 const MIN_LOD: i32 = -4;
 const MAX_LOD: i32 = 8;
@@ -658,10 +658,12 @@ impl ViewerApp {
             if ui.toggle_value(&mut self.search_opts.whole_word, "|w|").on_hover_text("Целое слово").changed() {
                 self.start_search();
             }
-            let label = if self.search_hits.is_empty() {
-                if self.search_query.trim().is_empty() { String::new() } else { "нет совпадений".to_string() }
-            } else {
+            let label = if !self.search_hits.is_empty() {
                 format!("{}/{}", self.search_active.map(|i| i + 1).unwrap_or(0), self.search_hits.len())
+            } else if self.search_query.trim().is_empty() || self.search_scanning {
+                String::new()
+            } else {
+                "нет совпадений".to_string()
             };
             ui.label(label);
             if self.search_scanning {
