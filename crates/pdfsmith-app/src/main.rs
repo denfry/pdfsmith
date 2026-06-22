@@ -15,7 +15,7 @@ use pdfsmith_engine::lod::lod_scale_for;
 use pdfsmith_engine::viewport::visible_tiles_center_out;
 
 mod render_thread;
-use render_thread::{spawn, Event, Job, RenderHandle, TILE};
+use render_thread::{spawn, Event, FindOpts, Job, MatchPt, RenderHandle, TILE};
 
 const MIN_LOD: i32 = -4;
 const MAX_LOD: i32 = 8;
@@ -94,6 +94,17 @@ impl Default for View {
     }
 }
 
+/// Совпадение поиска: страница + прямоугольник в page-point + диапазон символов.
+#[derive(Clone, Copy)]
+struct MatchHit {
+    page: usize,
+    rect: egui::Rect,
+    #[allow(dead_code)]
+    start: i32,
+    #[allow(dead_code)]
+    count: i32,
+}
+
 struct ViewerApp {
     handle: RenderHandle,
     page_sizes: Vec<(f32, f32)>,
@@ -114,6 +125,18 @@ struct ViewerApp {
     thumb_requested: Option<(usize, u8)>,
     show_minimap: bool,
     status_msg: Option<String>,
+    search_open: bool,
+    search_query: String,
+    search_opts: FindOpts,
+    search_generation: u64,
+    search_hits: Vec<MatchHit>,
+    search_active: Option<usize>,
+    search_scanning: bool,
+    search_scanned: usize,
+    search_total: usize,
+    search_focus: bool,
+    pending_jump: bool,
+    pending_close_search: bool,
 }
 
 impl ViewerApp {
@@ -148,6 +171,18 @@ impl ViewerApp {
             thumb_requested: None,
             show_minimap: true,
             status_msg: None,
+            search_open: false,
+            search_query: String::new(),
+            search_opts: FindOpts::default(),
+            search_generation: 0,
+            search_hits: Vec::new(),
+            search_active: None,
+            search_scanning: false,
+            search_scanned: 0,
+            search_total: 0,
+            search_focus: false,
+            pending_jump: false,
+            pending_close_search: false,
         }
     }
 
@@ -165,6 +200,9 @@ impl ViewerApp {
         self.rotation = (((self.rotation as i32) + delta).rem_euclid(4)) as u8;
         self.view.needs_fit = true;
         self.last_request = None;
+        if self.search_open && !self.search_query.trim().is_empty() {
+            self.start_search();
+        }
     }
 
     fn page_count(&self) -> usize {
@@ -236,11 +274,34 @@ impl ViewerApp {
                     self.status_msg = Some(format!("Сохранено: {}", path.display()));
                 }
                 Event::Error(e) => self.error = Some(e),
-                // Search/text events handled in future tasks — ignore for now.
-                Event::SearchPage { .. }
-                | Event::SearchProgress { .. }
-                | Event::SearchDone { .. }
-                | Event::PageText { .. } => {}
+                Event::SearchPage { generation, page, matches } => {
+                    if generation == self.search_generation {
+                        for m in matches {
+                            self.search_hits.push(MatchHit {
+                                page,
+                                rect: m.rect,
+                                start: m.start,
+                                count: m.count,
+                            });
+                        }
+                        if self.search_active.is_none() && !self.search_hits.is_empty() {
+                            self.search_active = Some(0);
+                            self.pending_jump = true;
+                        }
+                    }
+                }
+                Event::SearchProgress { generation, scanned, total } => {
+                    if generation == self.search_generation {
+                        self.search_scanned = scanned;
+                        self.search_total = total;
+                    }
+                }
+                Event::SearchDone { generation, .. } => {
+                    if generation == self.search_generation {
+                        self.search_scanning = false;
+                    }
+                }
+                Event::PageText { .. } => { /* используется в Task 6 */ }
             }
         }
     }
@@ -319,7 +380,7 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::Num0) {
                 self.pending = Some(Action::ActualSize);
             }
-            if i.key_pressed(egui::Key::F) {
+            if i.key_pressed(egui::Key::F) && !i.modifiers.command {
                 self.pending = Some(Action::FitPage);
             }
             if i.key_pressed(egui::Key::W) {
@@ -329,6 +390,13 @@ impl ViewerApp {
                 if let Some(p) = pick_pdf() {
                     self.open_path(p);
                 }
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::F) {
+                self.search_open = true;
+                self.search_focus = true;
+            }
+            if i.key_pressed(egui::Key::Escape) && self.search_open {
+                self.pending_close_search = true;
             }
             if i.key_pressed(egui::Key::OpenBracket) {
                 self.rotate(-1);
@@ -500,6 +568,140 @@ impl ViewerApp {
         }
     }
 
+    /// Запускает новый поиск (сбрасывает прежние результаты).
+    fn start_search(&mut self) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_hits.clear();
+        self.search_active = None;
+        self.search_scanned = 0;
+        self.search_total = self.page_count();
+        let q = self.search_query.trim().to_string();
+        if q.is_empty() {
+            self.search_scanning = false;
+            return;
+        }
+        self.search_scanning = true;
+        let _ = self.handle.job_tx.send(Job::Search {
+            query: q,
+            opts: self.search_opts,
+            start_page: self.page,
+            rotation: self.rotation,
+            generation: self.search_generation,
+        });
+    }
+
+    /// Переходит к совпадению по индексу (со сменой страницы и центрированием).
+    fn goto_hit(&mut self, idx: usize) {
+        if idx >= self.search_hits.len() {
+            return;
+        }
+        self.search_active = Some(idx);
+        let hit = self.search_hits[idx];
+        if hit.page != self.page {
+            self.set_page(hit.page);
+        }
+        self.pending_jump = true;
+    }
+
+    /// Сдвигает активное совпадение на `delta` (с заворотом).
+    fn step_hit(&mut self, delta: i32) {
+        let n = self.search_hits.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.search_active.unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        self.goto_hit(next);
+    }
+
+    /// Центрирует вид на прямоугольнике (page-point) активного совпадения.
+    fn center_on_rect(&mut self, rect: egui::Rect, canvas: egui::Rect) {
+        let center_pt = rect.center().to_vec2();
+        self.view.offset = canvas.center().to_vec2() - center_pt * self.view.zoom;
+    }
+
+    fn search_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .desired_width(220.0)
+                    .hint_text("Поиск (Ctrl+F)"),
+            );
+            if self.search_focus {
+                resp.request_focus();
+                self.search_focus = false;
+            }
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if resp.changed() {
+                self.start_search();
+            }
+            if enter {
+                // Enter — следующее совпадение (или новый поиск, если пусто).
+                if self.search_hits.is_empty() {
+                    self.start_search();
+                } else {
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    self.step_hit(if shift { -1 } else { 1 });
+                }
+                resp.request_focus();
+            }
+            if ui.button("▲").on_hover_text("Предыдущее (Shift+Enter)").clicked() {
+                self.step_hit(-1);
+            }
+            if ui.button("▼").on_hover_text("Следующее (Enter)").clicked() {
+                self.step_hit(1);
+            }
+            if ui.toggle_value(&mut self.search_opts.match_case, "Aa").on_hover_text("Учитывать регистр").changed() {
+                self.start_search();
+            }
+            if ui.toggle_value(&mut self.search_opts.whole_word, "|w|").on_hover_text("Целое слово").changed() {
+                self.start_search();
+            }
+            let label = if self.search_hits.is_empty() {
+                if self.search_query.trim().is_empty() { String::new() } else { "нет совпадений".to_string() }
+            } else {
+                format!("{}/{}", self.search_active.map(|i| i + 1).unwrap_or(0), self.search_hits.len())
+            };
+            ui.label(label);
+            if self.search_scanning {
+                ui.spinner();
+                ui.label(format!("{}/{}", self.search_scanned, self.search_total));
+            }
+            if ui.button("✕").on_hover_text("Закрыть (Esc)").clicked() {
+                self.close_search();
+            }
+        });
+    }
+
+    fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_hits.clear();
+        self.search_active = None;
+        self.search_scanning = false;
+        self.search_generation = self.search_generation.wrapping_add(1); // отсечь хвост
+    }
+
+    /// Подсветка совпадений на текущей странице.
+    fn draw_search_highlights(&self, painter: &egui::Painter) {
+        for (i, hit) in self.search_hits.iter().enumerate() {
+            if hit.page != self.page {
+                continue;
+            }
+            let screen = egui::Rect::from_min_size(
+                (self.view.offset + hit.rect.min.to_vec2() * self.view.zoom).to_pos2(),
+                hit.rect.size() * self.view.zoom,
+            );
+            let active = self.search_active == Some(i);
+            let color = if active {
+                egui::Color32::from_rgba_unmultiplied(255, 165, 0, 140)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 230, 0, 70)
+            };
+            painter.rect_filled(screen, 1.0, color);
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("📂 Открыть").clicked() {
@@ -659,9 +861,17 @@ impl eframe::App for ViewerApp {
         self.poll_events(ctx);
         self.handle_dropped(ctx);
         self.handle_keyboard(ctx);
+        if self.pending_close_search {
+            self.pending_close_search = false;
+            self.close_search();
+        }
         self.request_thumbnail();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+
+        if self.search_open {
+            egui::TopBottomPanel::top("search").show(ctx, |ui| self.search_bar(ui));
+        }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -757,6 +967,16 @@ impl eframe::App for ViewerApp {
             self.request_visible(lod, lod_scale, &visible);
             self.evict(&visible, lod);
             self.draw_minimap(ui, &painter, canvas);
+            self.draw_search_highlights(&painter);
+            if self.pending_jump {
+                self.pending_jump = false;
+                if let Some(idx) = self.search_active {
+                    if idx < self.search_hits.len() {
+                        let rect = self.search_hits[idx].rect;
+                        self.center_on_rect(rect, canvas);
+                    }
+                }
+            }
         });
     }
 }
