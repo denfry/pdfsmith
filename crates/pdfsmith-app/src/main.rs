@@ -71,6 +71,13 @@ fn main() {
 /// Ключ тайла-текстуры: (страница, поворот, LOD, столбец, строка).
 type TexKey = (usize, u8, i32, u32, u32);
 
+/// Режим активного инструмента в основной панели.
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Hand,
+    Text,
+}
+
 /// Отложенное действие, требующее размеров холста (применяется в центр-панели).
 #[derive(Clone, Copy)]
 enum Action {
@@ -137,6 +144,13 @@ struct ViewerApp {
     search_focus: bool,
     pending_jump: bool,
     pending_close_search: bool,
+    tool: Tool,
+    page_chars: Vec<char>,
+    page_boxes: Vec<egui::Rect>,
+    page_text_for: Option<(usize, u8)>,
+    page_text_requested: Option<(usize, u8)>,
+    sel_anchor: Option<usize>,
+    sel_cursor: Option<usize>,
 }
 
 impl ViewerApp {
@@ -183,6 +197,13 @@ impl ViewerApp {
             search_focus: false,
             pending_jump: false,
             pending_close_search: false,
+            tool: Tool::Hand,
+            page_chars: Vec::new(),
+            page_boxes: Vec::new(),
+            page_text_for: None,
+            page_text_requested: None,
+            sel_anchor: None,
+            sel_cursor: None,
         }
     }
 
@@ -301,7 +322,13 @@ impl ViewerApp {
                         self.search_scanning = false;
                     }
                 }
-                Event::PageText { .. } => { /* используется в Task 6 */ }
+                Event::PageText { page, rotation, chars, boxes } => {
+                    if page == self.page && rotation == self.rotation {
+                        self.page_chars = chars;
+                        self.page_boxes = boxes;
+                        self.page_text_for = Some((page, rotation));
+                    }
+                }
             }
         }
     }
@@ -321,6 +348,79 @@ impl ViewerApp {
             page: self.page,
             rotation: self.rotation,
         });
+    }
+
+    /// Запрашивает текст текущей страницы/поворота для выделения, если ещё нет.
+    fn request_page_text(&mut self) {
+        if !self.opened {
+            return;
+        }
+        let want = (self.page, self.rotation);
+        if self.page_text_for == Some(want) || self.page_text_requested == Some(want) {
+            return;
+        }
+        self.page_text_requested = Some(want);
+        // сбросить прежнее выделение при смене страницы/поворота
+        self.sel_anchor = None;
+        self.sel_cursor = None;
+        self.page_boxes.clear();
+        self.page_chars.clear();
+        self.page_text_for = None;
+        let _ = self.handle.job_tx.send(Job::PageText { page: self.page, rotation: self.rotation });
+    }
+
+    /// Индекс символа под точкой в page-point координатах (внутри бокса, иначе
+    /// ближайший по центру в пределах разумного допуска).
+    fn char_at_pagept(&self, p: egui::Vec2) -> Option<usize> {
+        let pt = p.to_pos2();
+        // 1) точное попадание
+        for (i, b) in self.page_boxes.iter().enumerate() {
+            if b.contains(pt) {
+                return Some(i);
+            }
+        }
+        // 2) ближайший центр (для кликов между строк/символов)
+        let mut best: Option<(usize, f32)> = None;
+        for (i, b) in self.page_boxes.iter().enumerate() {
+            let d = (b.center() - pt).length_sq();
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Текущий выделенный диапазон символов [min, max] включительно.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        match (self.sel_anchor, self.sel_cursor) {
+            (Some(a), Some(c)) => Some((a.min(c), a.max(c))),
+            _ => None,
+        }
+    }
+
+    /// Собирает текст выделения для копирования.
+    fn selection_text(&self) -> String {
+        match self.selection_range() {
+            Some((a, b)) if b < self.page_chars.len() => self.page_chars[a..=b].iter().collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// Рисует выделение текста на экране.
+    fn draw_selection(&self, painter: &egui::Painter) {
+        let Some((a, b)) = self.selection_range() else { return };
+        let color = egui::Color32::from_rgba_unmultiplied(80, 160, 255, 90);
+        for i in a..=b.min(self.page_boxes.len().saturating_sub(1)) {
+            let r = self.page_boxes[i];
+            if r.width() <= 0.0 && r.height() <= 0.0 {
+                continue;
+            }
+            let screen = egui::Rect::from_min_size(
+                (self.view.offset + r.min.to_vec2() * self.view.zoom).to_pos2(),
+                r.size() * self.view.zoom,
+            );
+            painter.rect_filled(screen, 0.0, color);
+        }
     }
 
     fn fit_page(&mut self, canvas: egui::Rect) {
@@ -429,8 +529,29 @@ impl ViewerApp {
     }
 
     fn handle_pan_zoom(&mut self, ui: &egui::Ui, response: &egui::Response) {
-        if response.dragged() {
-            self.view.offset += response.drag_delta();
+        match self.tool {
+            Tool::Hand => {
+                if response.dragged() {
+                    self.view.offset += response.drag_delta();
+                }
+            }
+            Tool::Text => {
+                if response.drag_started() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let p = pos.to_vec2() - self.view.offset;
+                        let pp = p / self.view.zoom;
+                        self.sel_anchor = self.char_at_pagept(pp);
+                        self.sel_cursor = self.sel_anchor;
+                    }
+                }
+                if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let p = pos.to_vec2() - self.view.offset;
+                        let pp = p / self.view.zoom;
+                        self.sel_cursor = self.char_at_pagept(pp);
+                    }
+                }
+            }
         }
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         if scroll != 0.0 {
@@ -735,6 +856,9 @@ impl ViewerApp {
                 self.rotate(1);
             }
             ui.separator();
+            ui.selectable_value(&mut self.tool, Tool::Hand, "✋").on_hover_text("Рука: панорама");
+            ui.selectable_value(&mut self.tool, Tool::Text, "🆃").on_hover_text("Текст: выделение");
+            ui.separator();
             if ui
                 .add_enabled(self.opened, egui::Button::new("⤓ PNG"))
                 .on_hover_text("Экспорт страницы в PNG")
@@ -868,6 +992,7 @@ impl eframe::App for ViewerApp {
             self.close_search();
         }
         self.request_thumbnail();
+        self.request_page_text();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
 
@@ -970,6 +1095,34 @@ impl eframe::App for ViewerApp {
             self.evict(&visible, lod);
             self.draw_minimap(ui, &painter, canvas);
             self.draw_search_highlights(&painter);
+            self.draw_selection(&painter);
+
+            // Курсор «текст» в режиме выделения над страницей.
+            if self.tool == Tool::Text && response.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+            }
+
+            // Копирование выделения.
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+                let text = self.selection_text();
+                if !text.is_empty() {
+                    ui.ctx().copy_text(text);
+                    self.status_msg = Some("Скопировано".into());
+                }
+            }
+
+            // Контекстное меню «Копировать».
+            response.context_menu(|ui| {
+                let has = self.selection_range().is_some();
+                if ui.add_enabled(has, egui::Button::new("Копировать")).clicked() {
+                    let text = self.selection_text();
+                    if !text.is_empty() {
+                        ui.ctx().copy_text(text);
+                    }
+                    ui.close_menu();
+                }
+            });
+
             if self.pending_jump {
                 self.pending_jump = false;
                 if let Some(idx) = self.search_active {
