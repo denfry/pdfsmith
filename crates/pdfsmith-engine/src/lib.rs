@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod disk_cache;
+pub mod geom;
 pub mod lod;
 pub mod tile;
 pub mod viewport;
