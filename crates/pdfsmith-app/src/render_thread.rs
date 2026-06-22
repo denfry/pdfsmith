@@ -92,7 +92,7 @@ pub enum Event {
     Error(String),
     SearchPage { generation: u64, page: usize, matches: Vec<MatchPt> },
     SearchProgress { generation: u64, scanned: usize, total: usize },
-    SearchDone { generation: u64, total_matches: usize },
+    SearchDone { generation: u64, document_has_text: bool },
     PageText { page: usize, rotation: u8, chars: Vec<char>, boxes: Vec<egui::Rect> },
 }
 
@@ -380,12 +380,12 @@ impl Worker {
     ) -> Option<Job> {
         let total = self.doc.as_ref().map(|d| d.page_count()).unwrap_or(0);
         let order = search_page_order(start_page, total);
-        let mut total_matches = 0usize;
+        let mut document_has_text = false;
         for (scanned, page) in order.into_iter().enumerate() {
             if let Ok(newer) = job_rx.try_recv() {
                 // Завершаем текущее поколение поиска, чтобы UI снял индикатор,
                 // даже если запрос отменён более свежим.
-                self.emit(Event::SearchDone { generation, total_matches });
+                self.emit(Event::SearchDone { generation, document_has_text });
                 return Some(newer);
             }
             let size = match self.doc.as_ref().and_then(|d| d.page_size(page)) {
@@ -397,14 +397,14 @@ impl Worker {
                 continue;
             }
             let pt = self.text_cache.get(&page).expect("в кэше");
+            if !pt.chars.is_empty() { document_has_text = true; }
             let matches = build_matches(pt, &query, opts, size.width_pt, size.height_pt, rotation);
-            total_matches += matches.len();
             if !matches.is_empty() {
                 self.emit(Event::SearchPage { generation, page, matches });
             }
             self.emit(Event::SearchProgress { generation, scanned: scanned + 1, total });
         }
-        self.emit(Event::SearchDone { generation, total_matches });
+        self.emit(Event::SearchDone { generation, document_has_text });
         None
     }
 

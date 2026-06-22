@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn whole_word_excludes_substring() {
-        // "cat" встречается отдельным словом (8) и внутри "scatter" (1).
+        // "cat" встречается отдельным словом (4) и внутри "scatter" (9).
         let t = chars("the cat scatter");
         assert_eq!(search_in_chars(&t, "cat", false, true), vec![TextMatch { start: 4, len: 3 }]);
     }

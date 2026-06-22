@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn point_corner_maps_per_rotation() {
-        // PDF нижне-левый угол (0,0) при rot0 → верхне-левый по X, низ по Y.
+        // PDF-угол (0,0): при rot0 → (0, H) (левый-нижний страницы); при rot1 → (0, 0).
         assert_eq!(pdf_point_to_page_pt(0.0, 0.0, W, H, 0), (0.0, 100.0));
         assert_eq!(pdf_point_to_page_pt(0.0, 0.0, W, H, 1), (0.0, 0.0));
     }

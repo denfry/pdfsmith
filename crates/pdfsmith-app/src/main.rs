@@ -142,6 +142,7 @@ struct ViewerApp {
     search_scanned: usize,
     search_total: usize,
     search_focus: bool,
+    search_doc_has_text: bool,
     pending_jump: bool,
     pending_close_search: bool,
     tool: Tool,
@@ -195,6 +196,7 @@ impl ViewerApp {
             search_scanned: 0,
             search_total: 0,
             search_focus: false,
+            search_doc_has_text: true,
             pending_jump: false,
             pending_close_search: false,
             tool: Tool::Hand,
@@ -221,6 +223,12 @@ impl ViewerApp {
         self.rotation = (((self.rotation as i32) + delta).rem_euclid(4)) as u8;
         self.view.needs_fit = true;
         self.last_request = None;
+        self.page_text_for = None;
+        self.page_text_requested = None;
+        self.page_boxes.clear();
+        self.page_chars.clear();
+        self.sel_anchor = None;
+        self.sel_cursor = None;
         if self.search_open && !self.search_query.trim().is_empty() {
             self.start_search();
         }
@@ -241,6 +249,13 @@ impl ViewerApp {
         self.page = 0;
         self.rotation = 0;
         self.view = View::default();
+        self.close_search();
+        self.page_chars.clear();
+        self.page_boxes.clear();
+        self.page_text_for = None;
+        self.page_text_requested = None;
+        self.sel_anchor = None;
+        self.sel_cursor = None;
         let _ = self.handle.job_tx.send(Job::Open(path));
     }
 
@@ -317,9 +332,10 @@ impl ViewerApp {
                         self.search_total = total;
                     }
                 }
-                Event::SearchDone { generation, .. } => {
+                Event::SearchDone { generation, document_has_text } => {
                     if generation == self.search_generation {
                         self.search_scanning = false;
+                        self.search_doc_has_text = document_has_text;
                     }
                 }
                 Event::PageText { page, rotation, chars, boxes } => {
@@ -783,8 +799,10 @@ impl ViewerApp {
                 format!("{}/{}", self.search_active.map(|i| i + 1).unwrap_or(0), self.search_hits.len())
             } else if self.search_query.trim().is_empty() || self.search_scanning {
                 String::new()
-            } else {
+            } else if self.search_doc_has_text {
                 "нет совпадений".to_string()
+            } else {
+                "нет текста (возможно, скан)".to_string()
             };
             ui.label(label);
             if self.search_scanning {
