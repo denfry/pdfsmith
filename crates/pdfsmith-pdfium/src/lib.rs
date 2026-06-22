@@ -16,6 +16,8 @@ use std::sync::{Mutex, OnceLock};
 
 use pdfium_render::prelude::*;
 
+pub mod text;
+
 /// Формат битмапа BGRA, 8 бит на канал (значение PDFium `FPDFBitmap_BGRA`).
 const FORMAT_BGRA: c_int = 4;
 
