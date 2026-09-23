@@ -24,6 +24,23 @@ pub(crate) const FORMAT_BGRA: c_int = 4;
 
 /// Флаг рендера: рисовать аннотации (без форм и попапов).
 const FPDF_ANNOT: c_int = 1;
+/// Флаг рендера: для печати (аннотации без флага «печатать» скрываются).
+const FPDF_PRINTING: c_int = 0x800;
+
+/// Параметры растеризации страницы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOpts {
+    pub antialias: bool,
+    pub annotations: bool,
+    /// Рендер для принтера: PDFium учитывает флаги печати аннотаций.
+    pub printing: bool,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        RenderOpts { antialias: true, annotations: true, printing: false }
+    }
+}
 
 /// Ошибки PDF-бэкенда.
 #[derive(Debug, thiserror::Error)]
@@ -195,6 +212,7 @@ impl Page {
     /// Матрица отображает страницу в device-пространство `FPDF_RenderPageBitmapWithMatrix`.
     /// Чистый масштаб даёт верную ориентацию (как в high-level pdfium-render);
     /// повороты — производные от него.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_region(
         &self,
         scale: f32,
@@ -204,6 +222,21 @@ impl Page {
         th: i32,
         rotation: u8,
         antialias: bool,
+    ) -> Result<RenderedImage, PdfError> {
+        self.render_region_opts(scale, tx, ty, tw, th, rotation, RenderOpts { antialias, ..RenderOpts::default() })
+    }
+
+    /// То же, что [`Page::render_region`], с полным набором параметров.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_region_opts(
+        &self,
+        scale: f32,
+        tx: i32,
+        ty: i32,
+        tw: i32,
+        th: i32,
+        rotation: u8,
+        opts: RenderOpts,
     ) -> Result<RenderedImage, PdfError> {
         if tw <= 0 || th <= 0 {
             return Err(PdfError::Render("неположительный размер тайла".into()));
@@ -239,7 +272,9 @@ impl Page {
         };
         let clip = FS_RECTF { left: 0.0, top: 0.0, right: tw as f32, bottom: th as f32 };
 
-        let flags = FPDF_ANNOT | if antialias { 0 } else { render_flags_no_aa() };
+        let flags = if opts.annotations { FPDF_ANNOT } else { 0 }
+            | if opts.printing { FPDF_PRINTING } else { 0 }
+            | if opts.antialias { 0 } else { render_flags_no_aa() };
         unsafe {
             b.FPDF_RenderPageBitmapWithMatrix(bitmap, self.handle, &matrix, &clip, flags);
         }

@@ -4,6 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
@@ -13,6 +15,8 @@ use pdfsmith_engine::viewport::visible_tiles_center_out;
 use pdfsmith_pdfium::Rgba;
 
 use crate::default_app::DefaultApp;
+use crate::print::PrintError;
+use crate::print_ui::{DocInfo, PrintDialog, PrintRequest};
 use crate::render_thread::{
     rotate_pt, spawn, ConvertOp, DispRect, EditOp, Event, ImageFormat, Job, PageTiles, RenderHandle,
     SearchHit, TILE,
@@ -71,6 +75,24 @@ enum Drag {
     /// Прямоугольник: страница, начало (display pt), текущая точка.
     Rect { page: usize, start: (f32, f32), cur: (f32, f32) },
     Ink { page: usize, points: Vec<(f32, f32)> },
+}
+
+/// Фигура аннотации поверх страницы (display pt текущего поворота).
+enum Mark {
+    Ink(Vec<(f32, f32)>),
+    Frame((f32, f32), (f32, f32)),
+    Marker((f32, f32), (f32, f32)),
+}
+
+/// Только что нарисованная аннотация: видна, пока страница не перерисуется
+/// с ней (иначе штрих мигнёт — старые тайлы ещё без него).
+struct Ghost {
+    page: usize,
+    mark: Mark,
+    color: Color32,
+    width: f32,
+    /// Рендер-поток подтвердил правку (`PageChanged`).
+    armed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,8 +213,12 @@ mod tests {
     }
 
     fn headless() -> Option<(egui::Context, ViewerApp)> {
+        headless_with(&std::env::var("PDFSMITH_TEST_PDF").unwrap_or_else(|_| "text.pdf".into()))
+    }
+
+    fn headless_with(name: &str) -> Option<(egui::Context, ViewerApp)> {
         let root = workspace_root();
-        let pdf = root.join("test_pdfs").join("text.pdf");
+        let pdf = root.join("test_pdfs").join(name);
         if !root.join("pdfium.dll").exists() || !pdf.exists() {
             eprintln!("ПРОПУСК: нет pdfium.dll или test_pdfs/text.pdf");
             return None;
@@ -227,8 +253,73 @@ mod tests {
         cond(app)
     }
 
+    /// Регрессия: после штриха карандашом страницы не должны оставаться белыми —
+    /// тайлы обязаны перерисоваться с новым поколением.
+    #[test]
+    fn headless_pen_stroke_rerenders_tiles() {
+        let _serial = crate::render_thread::pdfium_test_lock();
+        let Some((ctx, mut app)) = headless() else { return };
+        assert!(wait(&ctx, &mut app, 15.0, |a| a.opened), "документ не открылся: {:?}", app.error);
+        assert!(wait(&ctx, &mut app, 15.0, |a| !a.textures.is_empty()), "тайлы не пришли");
+        app.tool = Tool::Pen;
+        let r = app.page_screen_rect(app.current_page);
+        let a = r.min + (r.max - r.min) * 0.3;
+        let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        pump(&ctx, &mut app, vec![egui::Event::PointerMoved(a)]);
+        pump(&ctx, &mut app, vec![press(a, true)]);
+        for i in 1..=20 {
+            let p = a + Vec2::new(i as f32 * 8.0, (i as f32 * 0.7).sin() * 20.0);
+            pump(&ctx, &mut app, vec![egui::Event::PointerMoved(p)]);
+        }
+        let end = a + Vec2::new(160.0, 0.0);
+        pump(&ctx, &mut app, vec![egui::Event::PointerMoved(end), press(end, false)]);
+        pump(&ctx, &mut app, vec![egui::Event::PointerGone]);
+        assert!(wait(&ctx, &mut app, 15.0, |a| a.dirty), "штрих не применился; статус: {:?}", app.status.as_ref().map(|s| &s.0));
+        // Все тайлы последнего запроса должны прийти, даже если рендер
+        // перемежается миниатюрами боковой панели.
+        let all_visible = |a: &ViewerApp| {
+            a.last_request.as_ref().is_some_and(|(rot, lod, pages)| {
+                pages.iter().all(|(p, tiles)| {
+                    tiles.iter().all(|&(c, r)| {
+                        let k = (*p, *rot, *lod, c, r);
+                        a.textures.contains_key(&k) && !a.stale.contains(&k)
+                    })
+                })
+            })
+        };
+        let ok = wait(&ctx, &mut app, 15.0, all_visible);
+        let missing: usize = app.last_request.as_ref().map(|(rot, lod, pages)| {
+            pages.iter().map(|(p, t)| t.iter().filter(|&&(c, r)| !app.textures.contains_key(&(*p, *rot, *lod, c, r)) || app.stale.contains(&(*p, *rot, *lod, c, r))).count()).sum()
+        }).unwrap_or(0);
+        assert!(ok, "после штриха часть тайлов так и не пришла (белые места): не хватает {missing}");
+        assert!(app.ghosts.is_empty(), "призрак штриха не убран после перерисовки");
+
+        // Содержимое свежего рендера страницы: не пустое и со штрихом.
+        let page = app.current_page;
+        let (w, h) = app.page_pt(page);
+        let tiles: Vec<(u32, u32)> = (0..((w / TILE as f32).ceil() as u32)).flat_map(|c| (0..((h / TILE as f32).ceil() as u32)).map(move |r| (c, r))).collect();
+        let _ = app.handle.job_tx.send(Job::Tiles { gen: 9999, rotation: 0, lod: 0, lod_scale: 1.0, pages: vec![PageTiles { page, page_pt: (w, h), tiles: tiles.clone() }] });
+        let (mut dark, mut red, mut got) = (0usize, 0usize, 0usize);
+        let t0 = Instant::now();
+        while got < tiles.len() && t0.elapsed().as_secs() < 15 {
+            if let Ok(Event::Tile { gen: 9999, rgba, .. }) = app.handle.event_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                got += 1;
+                dark += rgba.chunks(4).filter(|p| p[0] < 128 && p[1] < 128 && p[2] < 128).count();
+                red += rgba.chunks(4).filter(|p| p[0] > 150 && p[1] < 100 && p[2] < 100).count();
+            }
+        }
+        eprintln!("tiles={got}/{} dark={dark} red={red}", tiles.len());
+        assert!(dark > 1000 && red > 20, "страница после штриха пустая: dark={dark} red={red}");
+    }
+
     #[test]
     fn headless_open_scroll_zoom_search_edit_save_convert() {
+        let _serial = crate::render_thread::pdfium_test_lock();
         let Some((ctx, mut app)) = headless() else { return };
         assert!(wait(&ctx, &mut app, 15.0, |a| a.opened), "документ не открылся: {:?}", app.error);
         pump(&ctx, &mut app, Vec::new());
@@ -271,11 +362,11 @@ mod tests {
         assert!(!app.hits.is_empty(), "поиск ничего не нашёл; статус: {:?}", app.status.as_ref().map(|s| &s.0));
         assert_eq!(app.active_hit, Some(0));
 
-        // Аннотация → документ помечен изменённым, кэши сброшены.
+        // Аннотация → документ помечен изменённым, общий кэш цел.
         let g = app.gen;
         app.edit(EditOp::Ink { page: 0, points: vec![(10.0, 10.0), (80.0, 40.0), (150.0, 20.0)], color: Rgba(200, 0, 0, 255), width: 3.0 });
-        assert!(wait(&ctx, &mut app, 15.0, |a| a.dirty), "Changed не пришёл");
-        assert!(app.gen > g);
+        assert!(wait(&ctx, &mut app, 15.0, |a| a.dirty), "PageChanged не пришёл");
+        assert_eq!(app.gen, g, "правка аннотации не должна сбрасывать все тайлы");
         // Удаление последней страницы.
         app.edit(EditOp::DeletePage(n - 1));
         assert!(wait(&ctx, &mut app, 15.0, |a| a.page_count() == n - 1), "страница не удалилась");
@@ -316,6 +407,9 @@ pub struct ViewerApp {
     current_page: usize,
     textures: HashMap<TexKey, egui::TextureHandle>,
     order: Vec<TexKey>,
+    /// Тайлы, устаревшие после правки аннотаций: рисуются, пока нет свежих.
+    stale: HashSet<TexKey>,
+    ghosts: Vec<Ghost>,
     last_request: Option<(u8, i32, Vec<(usize, Vec<(u32, u32)>)>)>,
     /// Поколение документа: растёт при открытии/изменении, отсекает устаревшие тайлы.
     gen: u32,
@@ -347,6 +441,9 @@ pub struct ViewerApp {
     convert: ConvertDialog,
     close_dialog: bool,
     show_help: bool,
+    print: PrintDialog,
+    /// Флаг отмены идущей печати.
+    print_cancel: Option<Arc<AtomicBool>>,
     // Статус.
     status: Option<(String, Instant, bool)>,
     progress: Option<(String, f32)>,
@@ -385,6 +482,8 @@ impl ViewerApp {
             current_page: 0,
             textures: HashMap::new(),
             order: Vec::new(),
+            stale: HashSet::new(),
+            ghosts: Vec::new(),
             last_request: None,
             gen: 0,
             opened: false,
@@ -419,6 +518,8 @@ impl ViewerApp {
             },
             close_dialog: false,
             show_help: false,
+            print: PrintDialog::default(),
+            print_cancel: None,
             status: None,
             progress: None,
             cursor_pt: None,
@@ -449,6 +550,8 @@ impl ViewerApp {
         self.gen = self.gen.wrapping_add(1);
         self.textures.clear();
         self.order.clear();
+        self.stale.clear();
+        self.ghosts.clear();
         self.thumbs.clear();
         self.thumb_requested.clear();
         self.thumb_inflight = 0;
@@ -469,6 +572,7 @@ impl ViewerApp {
 
     fn rotate_view(&mut self, delta: i32) {
         self.rotation = (((self.rotation as i32) + delta).rem_euclid(4)) as u8;
+        self.ghosts.clear();
         let page = self.current_page;
         self.rebuild_layout();
         self.thumb_requested.clear();
@@ -549,6 +653,19 @@ impl ViewerApp {
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
                 }
+                Event::PageChanged { page } => {
+                    self.dirty = true;
+                    // Старые тайлы страницы показываем, пока не придут новые.
+                    self.stale.extend(self.textures.keys().filter(|k| k.0 == page).copied());
+                    self.last_request = None;
+                    for g in self.ghosts.iter_mut().filter(|g| g.page == page) {
+                        g.armed = true;
+                    }
+                    self.thumb_requested.insert((page, self.rotation));
+                    self.thumb_inflight += 1;
+                    let _ = self.handle.job_tx.send(Job::Thumbnail { gen: self.gen, page, rotation: self.rotation });
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+                }
                 Event::PageLoading(v) => self.loading_page = v,
                 Event::Tile { gen, page, rotation, lod, col, row, width, height, rgba } => {
                     if rotation != self.rotation || gen != self.gen || page >= self.page_count() {
@@ -561,6 +678,7 @@ impl ViewerApp {
                     if self.textures.insert(key, tex).is_none() {
                         self.order.push(key);
                     }
+                    self.stale.remove(&key);
                 }
                 Event::Thumbnail { gen, page, rotation, width, height, rgba } => {
                     self.thumb_inflight = self.thumb_inflight.saturating_sub(1);
@@ -606,11 +724,24 @@ impl ViewerApp {
                     }
                 }
                 Event::Progress { msg, frac } => self.progress = Some((msg, frac)),
+                Event::PrintPreview { page, annotations, width, height, rgba } => {
+                    self.print.set_preview(page, annotations, width, height, rgba);
+                }
+                Event::PrintFinished(res) => {
+                    self.print_cancel = None;
+                    self.progress = None;
+                    match res {
+                        Ok(n) => self.set_status(format!("Отправлено на печать: {n} стр."), false),
+                        Err(PrintError::Cancelled) => self.set_status("Печать отменена", false),
+                        Err(PrintError::Failed(e)) => self.set_status(format!("Печать не удалась: {e}"), true),
+                    }
+                }
                 Event::Done(msg) => {
                     self.progress = None;
                     self.set_status(msg, false);
                 }
                 Event::Error(e) => {
+                    self.ghosts.clear();
                     self.progress = None;
                     self.searching = false;
                     self.thumb_inflight = 0;
@@ -767,11 +898,15 @@ impl ViewerApp {
     // Ввод
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // Окно печати обрабатывает Enter/Esc само; просмотр позади не трогаем.
+        if self.print.open {
+            return;
+        }
         // Хоткеи не должны срабатывать, пока фокус в текстовом поле.
         let typing = ctx.memory(|m| m.focused().is_some());
         let mods = ctx.input(|i| i.modifiers);
         if mods.command {
-            let (o, s, f, z, p, w) = ctx.input(|i| {
+            let (o, s, f, z, p, w, e) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::O),
                     i.key_pressed(egui::Key::S),
@@ -779,6 +914,7 @@ impl ViewerApp {
                     i.key_pressed(egui::Key::Z),
                     i.key_pressed(egui::Key::P),
                     i.key_pressed(egui::Key::W),
+                    i.key_pressed(egui::Key::E),
                 )
             });
             if o {
@@ -798,6 +934,9 @@ impl ViewerApp {
                 self.edit(EditOp::UndoAnnotation(self.current_page));
             }
             if p && self.opened {
+                self.open_print();
+            }
+            if e && self.opened {
                 self.export_png();
             }
             if w {
@@ -928,6 +1067,45 @@ impl ViewerApp {
         }
     }
 
+    fn open_print(&mut self) {
+        if !self.opened {
+            return;
+        }
+        self.print.show_for(self.store.data.last_printer.as_deref(), self.current_page);
+    }
+
+    fn print_window(&mut self, ctx: &egui::Context) {
+        if !self.print.open {
+            return;
+        }
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "pdfsmith".into());
+        let doc = DocInfo { name, current: self.current_page, sizes: &self.page_sizes, busy: self.print_cancel.is_some() };
+        for req in self.print.ui(ctx, &doc) {
+            match req {
+                PrintRequest::Preview { page, annotations } => {
+                    let _ = self.handle.job_tx.send(Job::PrintPreview { page, annotations });
+                }
+                PrintRequest::Print(job) => {
+                    if let Some(p) = self.print.printer() {
+                        if self.store.data.last_printer.as_deref() != Some(p) {
+                            self.store.data.last_printer = Some(p.to_string());
+                            self.store.save();
+                        }
+                    }
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    self.print_cancel = Some(cancel.clone());
+                    self.progress = Some(("Подготовка печати…".into(), 0.0));
+                    let _ = self.handle.job_tx.send(Job::Print { job, cancel });
+                }
+            }
+        }
+    }
+
     fn export_png(&mut self) {
         let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or("page".into());
         if let Some(path) = rfd::FileDialog::new()
@@ -1028,6 +1206,7 @@ impl ViewerApp {
             Drag::Pan => {}
             Drag::Ink { page, points } => {
                 if points.len() >= 2 {
+                    self.ghost(page, Mark::Ink(points.clone()));
                     self.edit(EditOp::Ink { page, points, color: rgba, width: self.pen_width });
                 }
             }
@@ -1046,13 +1225,21 @@ impl ViewerApp {
                         let _ = self.handle.job_tx.send(Job::CopyText { page, rotation: self.rotation, rect });
                     }
                     Tool::Highlight => {
+                        self.ghost(page, Mark::Marker(start, cur));
                         self.edit(EditOp::Highlight { page, rect, color: Rgba(255, 224, 64, 255) });
                     }
-                    Tool::Rect => self.edit(EditOp::Rect { page, rect, color: rgba, width: self.pen_width }),
+                    Tool::Rect => {
+                        self.ghost(page, Mark::Frame(start, cur));
+                        self.edit(EditOp::Rect { page, rect, color: rgba, width: self.pen_width });
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    fn ghost(&mut self, page: usize, mark: Mark) {
+        self.ghosts.push(Ghost { page, mark, color: self.pen_color, width: self.pen_width, armed: false });
     }
 
     // ------------------------------------------------------------------
@@ -1068,7 +1255,10 @@ impl ViewerApp {
             let missing: Vec<(u32, u32)> = tiles
                 .iter()
                 .copied()
-                .filter(|(c, r)| !self.textures.contains_key(&(*page, self.rotation, lod, *c, *r)))
+                .filter(|(c, r)| {
+                    let k = (*page, self.rotation, lod, *c, *r);
+                    !self.textures.contains_key(&k) || self.stale.contains(&k)
+                })
                 .collect();
             if !missing.is_empty() {
                 pages.push(PageTiles { page: *page, page_pt: self.page_pt(*page), tiles: missing });
@@ -1094,7 +1284,8 @@ impl ViewerApp {
             .keys()
             .filter(|(p, rot, lod, _, _)| *p == page && *rot == self.rotation && *lod <= current_lod)
             .collect();
-        keys.sort_by_key(|(_, _, lod, _, _)| *lod); // грубые сначала, резкие поверх
+        // Устаревшие снизу, затем грубые, резкие поверх.
+        keys.sort_by_key(|k| (!self.stale.contains(*k), k.2));
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
         for &&(_, _, lod, col, row) in &keys {
             let tex = &self.textures[&(page, self.rotation, lod, col, row)];
@@ -1115,6 +1306,7 @@ impl ViewerApp {
             }
             self.order.remove(i);
             self.textures.remove(&key);
+            self.stale.remove(&key);
         }
     }
 
@@ -1144,33 +1336,51 @@ impl ViewerApp {
                 }
             }
         }
+        // Свежие аннотации, которых ещё нет в тайлах.
+        for g in &self.ghosts {
+            if visible.contains(&g.page) {
+                self.draw_mark(painter, g.page, &g.mark, g.color, g.width);
+            }
+        }
         // Текущее действие инструмента.
         match &self.drag {
-            Some(Drag::Rect { page, start, cur }) => {
-                let base = self.page_screen_rect(*page).min;
-                let rect = Rect::from_two_pos(
-                    base + Vec2::new(start.0, start.1) * self.view.zoom,
-                    base + Vec2::new(cur.0, cur.1) * self.view.zoom,
-                );
-                match self.tool {
-                    Tool::Select => {
-                        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(80, 150, 255, 60));
-                        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_rgb(80, 150, 255)));
-                    }
-                    Tool::Highlight => {
-                        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 224, 64, 110));
-                    }
-                    _ => {
-                        painter.rect_stroke(rect, 0.0, Stroke::new(self.pen_width * self.view.zoom, self.pen_color));
-                    }
+            Some(Drag::Rect { page, start, cur }) => match self.tool {
+                Tool::Select => {
+                    let rect = self.disp_rect_on_screen(*page, *start, *cur);
+                    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(80, 150, 255, 60));
+                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_rgb(80, 150, 255)));
                 }
-            }
+                Tool::Highlight => self.draw_mark(painter, *page, &Mark::Marker(*start, *cur), self.pen_color, self.pen_width),
+                _ => self.draw_mark(painter, *page, &Mark::Frame(*start, *cur), self.pen_color, self.pen_width),
+            },
             Some(Drag::Ink { page, points }) => {
                 let base = self.page_screen_rect(*page).min;
                 let pts: Vec<Pos2> = points.iter().map(|&(x, y)| base + Vec2::new(x, y) * self.view.zoom).collect();
                 painter.add(egui::Shape::line(pts, Stroke::new(self.pen_width * self.view.zoom, self.pen_color)));
             }
             _ => {}
+        }
+    }
+
+    fn disp_rect_on_screen(&self, page: usize, a: (f32, f32), b: (f32, f32)) -> Rect {
+        let base = self.page_screen_rect(page).min;
+        Rect::from_two_pos(base + Vec2::new(a.0, a.1) * self.view.zoom, base + Vec2::new(b.0, b.1) * self.view.zoom)
+    }
+
+    fn draw_mark(&self, painter: &egui::Painter, page: usize, mark: &Mark, color: Color32, width: f32) {
+        let stroke = Stroke::new(width * self.view.zoom, color);
+        match mark {
+            Mark::Ink(points) => {
+                let base = self.page_screen_rect(page).min;
+                let pts: Vec<Pos2> = points.iter().map(|&(x, y)| base + Vec2::new(x, y) * self.view.zoom).collect();
+                painter.add(egui::Shape::line(pts, stroke));
+            }
+            Mark::Frame(a, b) => {
+                painter.rect_stroke(self.disp_rect_on_screen(page, *a, *b), 0.0, stroke);
+            }
+            Mark::Marker(a, b) => {
+                painter.rect_filled(self.disp_rect_on_screen(page, *a, *b), 0.0, Color32::from_rgba_unmultiplied(255, 224, 64, 110));
+            }
         }
     }
 
@@ -1248,6 +1458,25 @@ impl ViewerApp {
         per_page.sort_by_key(|(p, _)| (*p as i64 - self.current_page as i64).abs());
         self.request_visible(lod, lod_scale, per_page);
         self.evict(&protected);
+        // Призрак нужен, пока видимые тайлы его страницы не пришли свежими
+        // (при любом LOD: после смены масштаба новых тайлов ещё нет вовсе).
+        let unfinished: HashSet<usize> = self
+            .last_request
+            .as_ref()
+            .map(|(rot, lod, pages)| {
+                pages
+                    .iter()
+                    .filter(|(p, tiles)| {
+                        tiles.iter().any(|&(c, r)| {
+                            let k = (*p, *rot, *lod, c, r);
+                            !self.textures.contains_key(&k) || self.stale.contains(&k)
+                        })
+                    })
+                    .map(|(p, _)| *p)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.ghosts.retain(|g| !g.armed || unfinished.contains(&g.page));
         self.draw_overlays(&painter, canvas, &visible_pages);
     }
 
@@ -1323,6 +1552,9 @@ impl ViewerApp {
                 }
                 if icon_button(ui, ph::EXPORT, "Сохранить как…  (Ctrl+Shift+S)", false).clicked() {
                     self.save(true);
+                }
+                if icon_button(ui, ph::PRINTER, "Печать…  (Ctrl+P)", self.print.open).clicked() {
+                    self.open_print();
                 }
             });
             vsep(ui);
@@ -1422,7 +1654,7 @@ impl ViewerApp {
                     }
                 }
                 ui.add_enabled_ui(can, |ui| {
-                    if icon_button(ui, ph::IMAGE, "Экспорт страницы в PNG  (Ctrl+P)", false).clicked() {
+                    if icon_button(ui, ph::IMAGE, "Экспорт страницы в PNG  (Ctrl+E)", false).clicked() {
                         self.export_png();
                     }
                     vsep(ui);
@@ -1496,6 +1728,13 @@ impl ViewerApp {
                 ui.label(muted("·".into()));
                 ui.add(egui::ProgressBar::new(*frac).desired_width(140.0).desired_height(8.0));
                 ui.label(muted(msg.clone()));
+            }
+            if let Some(cancel) = &self.print_cancel {
+                let stopping = cancel.load(Ordering::Relaxed);
+                let text = if stopping { "Отмена…" } else { "Отменить печать" };
+                if ui.add_enabled(!stopping, egui::Button::new(egui::RichText::new(text).small())).clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(6.0);
@@ -1909,7 +2148,8 @@ impl ViewerApp {
                         ("Ctrl+Z", "отменить аннотацию"),
                         ("Ctrl+F, F3", "поиск, следующее совпадение"),
                         ("Ctrl+O / S / Shift+S", "открыть / сохранить / сохранить как"),
-                        ("Ctrl+P", "экспорт страницы в PNG"),
+                        ("Ctrl+P", "печать"),
+                        ("Ctrl+E", "экспорт страницы в PNG"),
                         ("ПКМ по странице", "операции со страницей"),
                         ("Перетащить файл", "открыть · Shift+PDF — добавить · картинки — вставить"),
                     ];
@@ -2052,6 +2292,7 @@ impl ViewerApp {
             });
 
         self.convert_window(ctx);
+        self.print_window(ctx);
         self.note_window(ctx);
         self.help_window(ctx);
         self.close_window(ctx);

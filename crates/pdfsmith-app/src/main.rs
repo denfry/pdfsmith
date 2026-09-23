@@ -11,6 +11,8 @@ use eframe::egui;
 
 mod app;
 mod default_app;
+mod print;
+mod print_ui;
 mod render_thread;
 mod settings;
 mod settings_ui;

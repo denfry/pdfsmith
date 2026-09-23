@@ -6,14 +6,19 @@
 //! редактирование, поиск, сохранение и конвертацию. Между тайлами проверяет,
 //! не пришёл ли более свежий запрос (отмена устаревших задач).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use eframe::egui;
 use pdfsmith_engine::disk_cache::{file_id, DiskCache, Tile};
-use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderedImage, Rgba};
+use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderOpts, RenderedImage, Rgba};
+
+use crate::print::{self, PrintError, PrintJob};
+use crate::print_ui::PREVIEW_PX;
 
 /// Сторона тайла в device-пикселях.
 pub const TILE: u32 = 256;
@@ -87,6 +92,10 @@ pub enum Job {
     Edit { op: EditOp, rotation: u8 },
     Save(PathBuf),
     Convert(ConvertOp),
+    /// Растр страницы для предпросмотра печати.
+    PrintPreview { page: usize, annotations: bool },
+    /// Печать; `cancel` взводит UI.
+    Print { job: PrintJob, cancel: Arc<AtomicBool> },
 }
 
 /// Одно вхождение поиска: страница, прямоугольники (display pt при повороте 0).
@@ -99,8 +108,10 @@ pub struct SearchHit {
 /// Событие из рендер-потока в UI.
 pub enum Event {
     Opened { path: PathBuf, page_sizes: Vec<(f32, f32)> },
-    /// Структура/содержимое документа изменились: сбросить кэши.
+    /// Структура документа изменилась: сбросить все кэши.
     Changed { page_sizes: Vec<(f32, f32)> },
+    /// Изменились аннотации одной страницы: перерисовать только её.
+    PageChanged { page: usize },
     PageLoading(bool),
     Tile { gen: u32, page: usize, rotation: u8, lod: i32, col: u32, row: u32, width: u32, height: u32, rgba: Vec<u8> },
     Thumbnail { gen: u32, page: usize, rotation: u8, width: u32, height: u32, rgba: Vec<u8> },
@@ -110,6 +121,9 @@ pub enum Event {
     Progress { msg: String, frac: f32 },
     Done(String),
     Error(String),
+    PrintPreview { page: usize, annotations: bool, width: u32, height: u32, rgba: Vec<u8> },
+    /// Печать закончилась: число отправленных листов или причина.
+    PrintFinished(Result<usize, PrintError>),
 }
 
 pub struct RenderHandle {
@@ -167,6 +181,8 @@ struct Worker {
     /// LRU загруженных страниц: последняя использованная — в конце.
     loaded: Vec<(usize, Page)>,
     dirty: bool,
+    /// Страницы с несохранёнными аннотациями: дисковый кэш для них устарел.
+    dirty_pages: HashSet<usize>,
 }
 
 fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dll_dir: Option<PathBuf>) {
@@ -178,7 +194,7 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
         return;
     }
 
-    let mut w = Worker { event_tx, ctx, doc: None, path: None, disk: None, loaded: Vec::new(), dirty: false };
+    let mut w = Worker { event_tx, ctx, doc: None, path: None, disk: None, loaded: Vec::new(), dirty: false, dirty_pages: HashSet::new() };
     // Очередь задач, снятых с канала раньше времени (см. схлопывание тайлов).
     let mut pending: VecDeque<Job> = VecDeque::new();
 
@@ -221,9 +237,7 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
             Job::ExportPng { path, page, rotation } => w.export_png(path, page, rotation),
             Job::Thumbnail { gen, page, rotation } => w.thumbnail(gen, page, rotation),
             Job::Tiles { gen, rotation, lod, lod_scale, pages } => {
-                if let Some(newer) = w.render_tiles(&job_rx, gen, rotation, lod, lod_scale, pages) {
-                    pending.push_back(newer);
-                }
+                w.render_tiles(&job_rx, &mut pending, gen, rotation, lod, lod_scale, pages);
             }
             Job::Search(q) => w.search(q),
             Job::CopyText { page, rotation, rect } => w.copy_text(page, rotation, rect),
@@ -238,6 +252,8 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
                     w.emit(Event::Error(e));
                 }
             }
+            Job::PrintPreview { page, annotations } => w.print_preview(page, annotations),
+            Job::Print { job, cancel } => w.print(job, &cancel),
         }
     }
 }
@@ -285,10 +301,20 @@ impl Worker {
         Ok(&self.loaded[i].1)
     }
 
-    /// После редактирования: страницы перезагрузить, кэш тайлов недействителен.
+    /// Дисковый кэш страницы, если он ещё соответствует её содержимому.
+    fn disk_for(&self, page: usize) -> Option<&DiskCache> {
+        if self.dirty_pages.contains(&page) {
+            None
+        } else {
+            self.disk.as_ref()
+        }
+    }
+
+    /// После структурной правки: страницы перезагрузить, кэш тайлов недействителен.
     fn mark_changed(&mut self) {
         self.loaded.clear();
         self.disk = None;
+        self.dirty_pages.clear();
         self.dirty = true;
         let sizes = self.sizes();
         self.emit(Event::Changed { page_sizes: sizes });
@@ -320,7 +346,7 @@ impl Worker {
     }
 
     fn thumbnail(&mut self, gen: u32, page: usize, rotation: u8) {
-        if let Some(t) = self.disk.as_ref().and_then(|d| d.get(page, rotation, THUMB_LOD, 0, 0)) {
+        if let Some(t) = self.disk_for(page).and_then(|d| d.get(page, rotation, THUMB_LOD, 0, 0)) {
             self.emit(Event::Thumbnail { gen, page, rotation, width: t.width, height: t.height, rgba: t.rgba });
             return;
         }
@@ -329,7 +355,7 @@ impl Worker {
         let scale = THUMB_PX / longest;
         match self.render_full(page, rotation, scale) {
             Ok(img) => {
-                if let Some(d) = &self.disk {
+                if let Some(d) = self.disk_for(page) {
                     d.put(page, rotation, THUMB_LOD, 0, 0, &Tile { width: img.width, height: img.height, rgba: img.rgba.clone() });
                 }
                 self.emit(Event::Thumbnail { gen, page, rotation, width: img.width, height: img.height, rgba: img.rgba });
@@ -347,6 +373,7 @@ impl Worker {
                 log::info!("документ открыт: страниц={}, диск-кэш={}", d.page_count(), disk.is_enabled());
                 // Сначала закрываем страницы старого документа, потом сам документ.
                 self.loaded.clear();
+                self.dirty_pages.clear();
                 self.disk = Some(disk);
                 self.doc = Some(d);
                 self.dirty = false;
@@ -361,25 +388,54 @@ impl Worker {
         }
     }
 
-    /// Рендерит тайлы. Возвращает `Some(job)`, если пришёл более свежий запрос.
+    /// Рендерит тайлы, между тайлами проверяя входящие задания:
+    /// - новый запрос тайлов вытесняет текущий (он уже включает всё недостающее);
+    /// - миниатюры откладываются до конца — они фоновые;
+    /// - прочее (правка, сохранение, поиск…) выполняется сразу, а недорисованный
+    ///   остаток возвращается в очередь следом. Выбрасывать его нельзя: UI не
+    ///   перезапросит тайлы, пока запрос не изменится, и страница останется белой.
+    #[allow(clippy::too_many_arguments)]
     fn render_tiles(
         &mut self,
         job_rx: &Receiver<Job>,
+        pending: &mut VecDeque<Job>,
         gen: u32,
         rotation: u8,
         lod: i32,
         lod_scale: f32,
         pages: Vec<PageTiles>,
-    ) -> Option<Job> {
-        for pt in pages {
+    ) {
+        let mut queue: VecDeque<PageTiles> = pages.into();
+        let mut deferred: Vec<Job> = Vec::new();
+        while let Some(mut pt) = queue.pop_front() {
             let page = pt.page;
             let page_w_px = (pt.page_pt.0 * lod_scale).round() as i32;
             let page_h_px = (pt.page_pt.1 * lod_scale).round() as i32;
-            for (col, row) in pt.tiles {
-                if let Ok(newer) = job_rx.try_recv() {
-                    return Some(newer);
+            let mut i = 0;
+            while i < pt.tiles.len() {
+                match job_rx.try_recv() {
+                    Ok(newer @ Job::Tiles { .. }) => {
+                        pending.push_back(newer);
+                        pending.extend(deferred);
+                        return;
+                    }
+                    Ok(thumb @ Job::Thumbnail { .. }) => {
+                        deferred.push(thumb);
+                        continue;
+                    }
+                    Ok(other) => {
+                        pt.tiles.drain(..i);
+                        queue.push_front(pt);
+                        pending.push_back(other);
+                        pending.push_back(Job::Tiles { gen, rotation, lod, lod_scale, pages: queue.into() });
+                        pending.extend(deferred);
+                        return;
+                    }
+                    Err(_) => {}
                 }
-                if let Some(t) = self.disk.as_ref().and_then(|d| d.get(page, rotation, lod, col, row)) {
+                let (col, row) = pt.tiles[i];
+                i += 1;
+                if let Some(t) = self.disk_for(page).and_then(|d| d.get(page, rotation, lod, col, row)) {
                     self.emit(Event::Tile { gen, page, rotation, lod, col, row, width: t.width, height: t.height, rgba: t.rgba });
                     continue;
                 }
@@ -396,19 +452,20 @@ impl Worker {
                 };
                 match res {
                     Ok(img) => {
-                        if let Some(d) = &self.disk {
+                        if let Some(d) = self.disk_for(page) {
                             d.put(page, rotation, lod, col, row, &Tile { width: img.width, height: img.height, rgba: img.rgba.clone() });
                         }
                         self.emit(Event::Tile { gen, page, rotation, lod, col, row, width: img.width, height: img.height, rgba: img.rgba });
                     }
                     Err(e) => {
                         self.emit(Event::Error(e));
-                        return None;
+                        pending.extend(deferred);
+                        return;
                     }
                 }
             }
         }
-        None
+        pending.extend(deferred);
     }
 
     fn search(&mut self, query: String) {
@@ -516,14 +573,20 @@ impl Worker {
                     })
                     .collect();
                 pg.add_ink(&pts, color, width).map_err(|e| e.to_string())?;
+                self.mark_page_changed(page);
+                return Ok(());
             }
             EditOp::Rect { page, rect, color, width } => {
                 let r = self.disp_rect_to_pdf(page, rotation, rect)?;
                 self.page(page)?.add_rect(r, color, width).map_err(|e| e.to_string())?;
+                self.mark_page_changed(page);
+                return Ok(());
             }
             EditOp::Highlight { page, rect, color } => {
                 let r = self.disp_rect_to_pdf(page, rotation, rect)?;
                 self.page(page)?.add_highlight(r, color).map_err(|e| e.to_string())?;
+                self.mark_page_changed(page);
+                return Ok(());
             }
             EditOp::Note { page, x, y, text, color } => {
                 let size = self.doc.as_ref().and_then(|d| d.page_size(page)).ok_or("нет страницы")?;
@@ -531,15 +594,61 @@ impl Worker {
                 let pg = self.page(page)?;
                 let (px, py) = pg.display_to_pdf(ux, uy);
                 pg.add_note(px, py, &text, color).map_err(|e| e.to_string())?;
+                self.mark_page_changed(page);
+                return Ok(());
             }
             EditOp::UndoAnnotation(page) => {
                 if !self.page(page)?.remove_last_annotation() {
                     return Err("на странице нет аннотаций для отмены".into());
                 }
+                self.mark_page_changed(page);
+                return Ok(());
             }
         }
         self.mark_changed();
         Ok(())
+    }
+
+    /// После правки аннотаций: страница остаётся загруженной (PDFium строит
+    /// список аннотаций заново при каждом рендере), остальной кэш цел.
+    fn mark_page_changed(&mut self, page: usize) {
+        self.dirty = true;
+        self.dirty_pages.insert(page);
+        self.emit(Event::PageChanged { page });
+    }
+
+    fn print_preview(&mut self, page: usize, annotations: bool) {
+        let Some(size) = self.doc.as_ref().and_then(|d| d.page_size(page)) else { return };
+        let scale = PREVIEW_PX / size.width_pt.max(size.height_pt).max(1.0);
+        let w = ((size.width_pt * scale).round() as i32).max(1);
+        let h = ((size.height_pt * scale).round() as i32).max(1);
+        let opts = RenderOpts { annotations, printing: true, ..RenderOpts::default() };
+        let res = self.page(page).and_then(|p| p.render_region_opts(scale, 0, 0, w, h, 0, opts).map_err(|e| e.to_string()));
+        match res {
+            Ok(img) => self.emit(Event::PrintPreview { page, annotations, width: img.width, height: img.height, rgba: img.rgba }),
+            Err(e) => self.emit(Event::Error(e)),
+        }
+    }
+
+    /// Печать текущего состояния документа (с несохранёнными правками).
+    fn print(&mut self, job: PrintJob, cancel: &AtomicBool) {
+        let sizes = self.sizes();
+        let (tx, ctx) = (self.event_tx.clone(), self.ctx.clone());
+        let mut progress = |i: usize, n: usize| {
+            let msg = format!("Печать: страница {} из {n}", (i + 1).min(n));
+            let _ = tx.send(Event::Progress { msg, frac: i as f32 / n.max(1) as f32 });
+            ctx.request_repaint();
+        };
+        let opts = RenderOpts { annotations: job.annotations, printing: true, ..RenderOpts::default() };
+        let mut render = |page: usize, scale: f32, x: i32, y: i32, w: i32, h: i32, rot: u8| -> Result<RenderedImage, String> {
+            self.page(page)?.render_region_opts(scale, x, y, w, h, rot, opts).map_err(|e| e.to_string())
+        };
+        log::info!("печать: {} стр. × {} на «{}»", job.pages.len(), job.copies, job.printer);
+        let res = print::print(&job, &sizes, &mut render, &mut progress, cancel);
+        if let Err(e) = &res {
+            log::warn!("печать не удалась: {e:?}");
+        }
+        self.emit(Event::PrintFinished(res));
     }
 
     fn save(&mut self, path: PathBuf) {
@@ -550,6 +659,7 @@ impl Worker {
         match doc.save_to(&path) {
             Ok(()) => {
                 self.dirty = false;
+                self.dirty_pages.clear();
                 self.path = Some(path.clone());
                 let id = format!("{}-{CACHE_VERSION}", file_id(&path));
                 self.disk = Some(DiskCache::new(&cache_root(), &id));
@@ -690,6 +800,14 @@ fn decode_text(bytes: &[u8]) -> String {
     body.iter().map(|&b| cp1251(b)).collect()
 }
 
+/// PDFium нельзя гонять из нескольких тестов сразу (последовательности
+/// вызовов должны быть атомарны) — тесты с ним берут этот замок.
+#[cfg(test)]
+pub(crate) fn pdfium_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +823,52 @@ mod tests {
         // 90° по часовой: левый-верхний угол уходит в правый-верхний.
         assert_eq!(rotate_pt(0.0, 0.0, 1, wh), (500.0, 0.0));
         assert_eq!(rotate_pt(0.0, 0.0, 3, wh), (0.0, 300.0));
+    }
+
+    /// Регрессия «белый экран после рисования»: миниатюра, пришедшая посреди
+    /// рендера тайлов, не должна отменять оставшиеся тайлы — UI их повторно не
+    /// запросит (запрос не изменился), и страница останется белой.
+    #[test]
+    fn thumbnail_does_not_cancel_pending_tiles() {
+        let _serial = pdfium_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let pdf = root.join("test_pdfs").join("text.pdf");
+        if !root.join("pdfium.dll").exists() || !pdf.exists() {
+            eprintln!("ПРОПУСК: нет pdfium.dll или test_pdfs/text.pdf");
+            return;
+        }
+        let h = spawn(egui::Context::default(), Some(root));
+        h.job_tx.send(Job::Open(pdf)).unwrap();
+        let sizes = loop {
+            match h.event_rx.recv_timeout(std::time::Duration::from_secs(15)).expect("нет Opened") {
+                Event::Opened { page_sizes, .. } => break page_sizes,
+                Event::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        };
+        // Крупный масштаб: много тайлов, рендер заметно дольше одного тайла.
+        let scale = 4.0;
+        let (w, hh) = sizes[0];
+        let cols = ((w * scale) / TILE as f32).ceil() as u32;
+        let rows = ((hh * scale) / TILE as f32).ceil() as u32;
+        let tiles: Vec<(u32, u32)> = (0..rows).flat_map(|r| (0..cols).map(move |c| (c, r))).collect();
+        let total = tiles.len();
+        // Уникальный LOD — ключ дискового кэша: тайлы не придут готовыми из прошлого прогона.
+        let lod = 1000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() % 100_000) as i32;
+        h.job_tx.send(Job::Tiles { gen: 1, rotation: 0, lod, lod_scale: scale, pages: vec![PageTiles { page: 0, page_pt: (w, hh), tiles }] }).unwrap();
+        // Даём начать рендер, затем подкидываем миниатюры, как боковая панель.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        for p in 1..4 {
+            h.job_tx.send(Job::Thumbnail { gen: 1, page: p, rotation: 0 }).unwrap();
+        }
+        let mut got = std::collections::HashSet::new();
+        let t0 = std::time::Instant::now();
+        while got.len() < total && t0.elapsed().as_secs() < 30 {
+            if let Ok(Event::Tile { col, row, .. }) = h.event_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                got.insert((col, row));
+            }
+        }
+        assert_eq!(got.len(), total, "тайлы потерялись после миниатюр: {}/{total}", got.len());
     }
 
     #[test]

@@ -11,11 +11,13 @@ pub struct Settings {
     pub last_check: Option<u64>,
     pub skipped_version: Option<String>,
     pub ask_default_app: bool,
+    /// Принтер, на котором печатали в прошлый раз.
+    pub last_printer: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true }
+        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None }
     }
 }
 
@@ -115,7 +117,13 @@ mod tests {
     #[test]
     fn roundtrip_creates_dirs_and_overwrites() {
         let p = tmp("roundtrip").join("nested").join("settings.json");
-        let mut s = Settings { auto_update: true, last_check: Some(42), skipped_version: Some("1.2.3".into()), ask_default_app: false };
+        let mut s = Settings {
+            auto_update: true,
+            last_check: Some(42),
+            skipped_version: Some("1.2.3".into()),
+            ask_default_app: false,
+            last_printer: Some("Microsoft Print to PDF".into()),
+        };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
         s.last_check = Some(43);

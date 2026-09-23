@@ -124,3 +124,30 @@ fn image_and_text_pages() {
     let out = std::env::temp_dir().join("pdfsmith_text_test.pdf");
     doc.save_to(&out).unwrap();
 }
+
+/// Регрессия «после рисования страница белая»: штрих → закрыть страницу →
+/// загрузить заново → рендер должен содержать и исходный текст, и штрих.
+#[test]
+fn ink_survives_page_reload_and_keeps_content() {
+    let _g = serial();
+    let Some(pdf) = sample() else { return };
+    let doc = Document::open(&pdf, None).unwrap();
+    let count_dark = |img: &pdfsmith_pdfium::RenderedImage| img.rgba.chunks(4).filter(|p| p[0] < 128 && p[1] < 128 && p[2] < 128).count();
+    let count_red = |img: &pdfsmith_pdfium::RenderedImage| img.rgba.chunks(4).filter(|p| p[0] > 150 && p[1] < 90 && p[2] < 90).count();
+
+    let page = doc.load_page(0).unwrap();
+    let (w, h) = ((page.width_pt()) as i32, (page.height_pt()) as i32);
+    let before = page.render_region(1.0, 0, 0, w, h, 0, true).unwrap();
+    let pts: Vec<(f32, f32)> = [(60.0, 60.0), (160.0, 120.0), (260.0, 80.0)]
+        .iter()
+        .map(|&(x, y)| page.display_to_pdf(x, y))
+        .collect();
+    page.add_ink(&pts, Rgba(220, 30, 30, 255), 3.0).unwrap();
+    drop(page);
+
+    let page = doc.load_page(0).unwrap();
+    let after = page.render_region(1.0, 0, 0, w, h, 0, true).unwrap();
+    eprintln!("dark before={} after={} red after={}", count_dark(&before), count_dark(&after), count_red(&after));
+    assert!(count_dark(&after) * 2 > count_dark(&before), "исходное содержимое пропало после штриха");
+    assert!(count_red(&after) > 50, "штрих не отрисовался");
+}
