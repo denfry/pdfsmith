@@ -11,6 +11,7 @@ use eframe::egui;
 
 mod app;
 mod render_thread;
+mod settings;
 mod theme;
 
 fn main() {

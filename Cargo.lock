@@ -2099,8 +2099,11 @@ dependencies = [
  "log",
  "pdfsmith-engine",
  "pdfsmith-pdfium",
+ "pdfsmith-update",
  "pollster",
  "rfd",
+ "serde",
+ "serde_json",
  "winresource",
 ]
 
