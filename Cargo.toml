@@ -23,3 +23,11 @@ log = "0.4"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Dev/test-сборки без отладочной информации: в разы меньше места на диске и
+# быстрее линковка. Для отладки с бэктрейсами включить `debug = 1` локально.
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

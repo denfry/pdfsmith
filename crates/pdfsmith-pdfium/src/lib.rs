@@ -16,8 +16,14 @@ use std::sync::{Mutex, OnceLock};
 
 use pdfium_render::prelude::*;
 
+pub mod edit;
+pub use edit::{PdfRect, Rgba, SearchHit};
+
 /// Формат битмапа BGRA, 8 бит на канал (значение PDFium `FPDFBitmap_BGRA`).
-const FORMAT_BGRA: c_int = 4;
+pub(crate) const FORMAT_BGRA: c_int = 4;
+
+/// Флаг рендера: рисовать аннотации (без форм и попапов).
+const FPDF_ANNOT: c_int = 1;
 
 /// Ошибки PDF-бэкенда.
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +66,7 @@ pub fn init(dll_dir: Option<&Path>) -> Result<(), PdfError> {
     Ok(())
 }
 
-fn bindings() -> &'static dyn PdfiumLibraryBindings {
+pub(crate) fn bindings() -> &'static dyn PdfiumLibraryBindings {
     BINDINGS
         .get()
         .expect("pdfsmith_pdfium::init() должен быть вызван до использования")
@@ -88,9 +94,9 @@ fn bind(dll_dir: Option<&Path>) -> Result<Box<dyn PdfiumLibraryBindings>, PdfErr
 /// Открытый PDF-документ. Держит размеры всех страниц (дёшево, без загрузки
 /// самих страниц) и байты файла (PDFium ссылается на них, пока документ открыт).
 pub struct Document {
-    handle: FPDF_DOCUMENT,
-    _bytes: Vec<u8>,
-    page_sizes: Vec<PageSize>,
+    pub(crate) handle: FPDF_DOCUMENT,
+    pub(crate) _bytes: Vec<u8>,
+    pub(crate) page_sizes: Vec<PageSize>,
 }
 
 impl Document {
@@ -166,9 +172,9 @@ impl Drop for Document {
 /// Загруженная страница. Держится открытой ради дешёвого повторного рендера
 /// тайлов.
 pub struct Page {
-    handle: FPDF_PAGE,
-    width_pt: f32,
-    height_pt: f32,
+    pub(crate) handle: FPDF_PAGE,
+    pub(crate) width_pt: f32,
+    pub(crate) height_pt: f32,
 }
 
 impl Page {
@@ -233,7 +239,7 @@ impl Page {
         };
         let clip = FS_RECTF { left: 0.0, top: 0.0, right: tw as f32, bottom: th as f32 };
 
-        let flags = if antialias { 0 } else { render_flags_no_aa() };
+        let flags = FPDF_ANNOT | if antialias { 0 } else { render_flags_no_aa() };
         unsafe {
             b.FPDF_RenderPageBitmapWithMatrix(bitmap, self.handle, &matrix, &clip, flags);
         }
