@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "pdfsmith-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "egui-phosphor",
@@ -2124,14 +2124,14 @@ dependencies = [
 
 [[package]]
 name = "pdfsmith-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "pdfsmith-pdfium"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "image",
  "log",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "pdfsmith-update"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "semver",
