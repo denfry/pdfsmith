@@ -69,7 +69,7 @@ pub fn download(
 ) -> Result<PathBuf, Error> {
     std::fs::create_dir_all(dir)?;
     let target = installer_path(dir, &m.version);
-    if target.exists() {
+    if target.is_file() {
         if sha256_file(&target)? == m.sha256 {
             return Ok(target);
         }
@@ -79,8 +79,13 @@ pub fn download(
     let result = fetch_to(agent, m, &part, cancel, progress);
     match result {
         Ok(hash) if hash == m.sha256 => {
-            std::fs::rename(&part, &target)?;
-            Ok(target)
+            match std::fs::rename(&part, &target) {
+                Ok(()) => Ok(target),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    Err(Error::Io(e))
+                }
+            }
         }
         Ok(_) => {
             let _ = std::fs::remove_file(&part);

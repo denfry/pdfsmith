@@ -168,3 +168,24 @@ fn cleanup_removes_old_installers_only() {
     left.sort();
     assert_eq!(left, vec!["other.txt".to_string(), "pdfsmith-setup-0.3.0.exe".to_string()]);
 }
+
+#[test]
+fn rename_failure_leaves_no_part() {
+    let (l, base) = bind();
+    serve(l, vec![route("/setup.exe", body())]);
+    let dir = tmpdir("rename_fail");
+    // Create a directory at the target path so rename will fail
+    let target_dir = download::installer_path(&dir, "9.9.9");
+    std::fs::create_dir(&target_dir).unwrap();
+    std::fs::write(target_dir.join("file_inside"), b"x").unwrap();
+
+    let m = manifest(&base, "9.9.9", &body());
+    let r = download::download(&download::agent(), &m, &dir, &AtomicBool::new(false), &mut |_, _| {});
+
+    // Should get an Io error
+    assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
+
+    // No .part file should be left
+    let lefts = leftovers(&dir);
+    assert!(!lefts.iter().any(|f| f.ends_with(".part")), "leftover .part file: {:?}", lefts);
+}
