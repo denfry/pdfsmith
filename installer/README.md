@@ -9,9 +9,11 @@
 ## Шаги
 1. (если меняли иконку) `python assets\make_icon.py`
 2. `cargo build --release --bin pdfsmith`
-3. `& "<ISCC.exe>" installer\pdfsmith.iss`
+3. `& "<ISCC.exe>" /DAppVersion=0.1.0 installer\pdfsmith.iss`
    - winget ставит ISCC per-user в `%LocalAppData%\Programs\Inno Setup 6\ISCC.exe`
      (либо системно — `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`).
+   - `/DAppVersion` — версия для номера сборки установщика; при ручном запуске
+     подставьте текущую версию. CI передаёт реальную версию из тега релиза.
 4. Готовый файл: `dist\pdfsmith-setup.exe`
 
 ## Что делает установщик

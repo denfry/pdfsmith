@@ -14,6 +14,7 @@ CloseApplications=force
 RestartApplications=no
 AppPublisher=PDFsmith
 DefaultDirName={localappdata}\{#AppName}
+DisableDirPage=yes
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
