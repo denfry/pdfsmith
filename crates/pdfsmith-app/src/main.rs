@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 mod app;
+mod default_app;
 mod render_thread;
 mod settings;
 mod theme;
