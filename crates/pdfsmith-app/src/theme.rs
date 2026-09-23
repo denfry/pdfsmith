@@ -114,3 +114,8 @@ pub fn vsep(ui: &mut egui::Ui) {
     let x = rect.center().x;
     ui.painter().line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)], Stroke::new(1.0, LINE));
 }
+
+/// Рамка информационной плашки под панелью инструментов.
+pub fn banner_frame() -> egui::Frame {
+    egui::Frame::none().fill(ACCENT_DIM).inner_margin(egui::Margin::symmetric(8.0, 4.0))
+}

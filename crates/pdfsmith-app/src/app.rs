@@ -12,11 +12,14 @@ use pdfsmith_engine::lod::lod_scale_for;
 use pdfsmith_engine::viewport::visible_tiles_center_out;
 use pdfsmith_pdfium::Rgba;
 
+use crate::default_app::DefaultApp;
 use crate::render_thread::{
     rotate_pt, spawn, ConvertOp, DispRect, EditOp, Event, ImageFormat, Job, PageTiles, RenderHandle,
     SearchHit, TILE,
 };
+use crate::settings::SettingsStore;
 use crate::theme::{self, icon_button, vsep};
+use crate::updates::{UpdState, UpdateUi};
 
 const MIN_LOD: i32 = -4;
 const MAX_LOD: i32 = 8;
@@ -348,12 +351,22 @@ pub struct ViewerApp {
     status: Option<(String, Instant, bool)>,
     progress: Option<(String, f32)>,
     cursor_pt: Option<(usize, f32, f32)>,
+    // Настройки, обновления, «по умолчанию».
+    store: SettingsStore,
+    upd: UpdateUi,
+    def_app: DefaultApp,
+    show_settings: bool,
 }
 
 impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         let dll_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        Self::with_context(cc.egui_ctx.clone(), dll_dir, path)
+        let mut app = Self::with_context(cc.egui_ctx.clone(), dll_dir, path);
+        // Боевые настройки, сеть и реестр — только в настоящем окне, не в тестах.
+        app.store = SettingsStore::load_default();
+        app.upd = UpdateUi::new(&cc.egui_ctx, &app.store);
+        app.def_app = DefaultApp::detect();
+        app
     }
 
     /// Создание без eframe (тесты): контекст egui и папка с `pdfium.dll`.
@@ -409,6 +422,10 @@ impl ViewerApp {
             status: None,
             progress: None,
             cursor_pt: None,
+            store: SettingsStore::in_memory(),
+            upd: UpdateUi::disabled(),
+            def_app: DefaultApp::disabled(),
+            show_settings: false,
         }
     }
 
@@ -1389,6 +1406,9 @@ impl ViewerApp {
                 if icon_button(ui, ph::INFO, "Горячие клавиши  (F1)", self.show_help).clicked() {
                     self.show_help = !self.show_help;
                 }
+                if icon_button(ui, ph::GEAR, "Настройки", self.show_settings).clicked() {
+                    self.show_settings = !self.show_settings;
+                }
                 if ui
                     .add(egui::Button::new(egui::RichText::new(format!("{}  Конвертер", ph::SWAP))).min_size(Vec2::new(0.0, 26.0)))
                     .on_hover_text("PDF ↔ изображения, текст; объединение и разделение")
@@ -1467,6 +1487,10 @@ impl ViewerApp {
                 ui.label(muted("·".into()));
                 ui.add(egui::Spinner::new().size(12.0));
                 ui.label(muted("Разбор страницы…".into()));
+            }
+            if let Some(text) = self.upd.status_text(&self.store) {
+                ui.label(muted("·".into()));
+                ui.label(muted(text));
             }
             if let Some((msg, frac)) = &self.progress {
                 ui.label(muted("·".into()));
@@ -1930,7 +1954,10 @@ impl ViewerApp {
                 self.close_dialog = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Some(2) => self.close_dialog = false,
+            Some(2) => {
+                self.close_dialog = false;
+                self.upd.cancel_restart();
+            }
             _ => {}
         }
     }
@@ -1940,12 +1967,30 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame(ctx);
     }
+
+    fn on_exit(&mut self) {
+        let others = pdfsmith_update::apply::other_instances_running();
+        match self.upd.exit_action(others) {
+            Some((path, relaunch)) => {
+                log::info!("запуск установщика {} (перезапуск: {relaunch})", path.display());
+                if let Err(e) = pdfsmith_update::apply::launch_installer(&path, relaunch) {
+                    log::error!("не удалось запустить установщик: {e}");
+                }
+            }
+            None if others && matches!(self.upd.state, UpdState::Ready { .. }) => {
+                log::info!("обновление отложено: открыты другие окна PDFsmith");
+            }
+            None => {}
+        }
+    }
 }
 
 impl ViewerApp {
     /// Один кадр UI (вынесен из `eframe::App`, чтобы гонять без окна в тестах).
     pub fn frame(&mut self, ctx: &egui::Context) {
         self.poll_events(ctx);
+        self.upd.poll(&mut self.store);
+        self.def_app.poll();
         self.handle_dropped(ctx);
         self.handle_keyboard(ctx);
 
@@ -1957,6 +2002,18 @@ impl ViewerApp {
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6.0, 5.0)))
             .show(ctx, |ui| self.toolbar(ui));
+
+        // Одна плашка за раз: обновление важнее предложения «по умолчанию».
+        if self.upd.banner_visible(&self.store) {
+            egui::TopBottomPanel::top("banner")
+                .frame(theme::banner_frame())
+                .show(ctx, |ui| self.upd.banner(ui, &mut self.store));
+        } else if self.def_app.banner_visible(self.store.data.ask_default_app) {
+            egui::TopBottomPanel::top("banner")
+                .frame(theme::banner_frame())
+                .show(ctx, |ui| self.def_app.banner(ui, &mut self.store));
+        }
+
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6.0, 3.0)))
             .show(ctx, |ui| self.status_bar(ui));
@@ -1998,6 +2055,7 @@ impl ViewerApp {
         self.note_window(ctx);
         self.help_window(ctx);
         self.close_window(ctx);
+        crate::settings_ui::settings_window(ctx, &mut self.show_settings, &mut self.store, &mut self.upd, &mut self.def_app);
     }
 }
 

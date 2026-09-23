@@ -13,6 +13,7 @@ mod app;
 mod default_app;
 mod render_thread;
 mod settings;
+mod settings_ui;
 mod theme;
 mod updates;
 
