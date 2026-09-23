@@ -7,6 +7,8 @@
 - Inno Setup 6 (`winget install --id JRSoftware.InnoSetup -e`).
 
 ## Шаги
+0. `pwsh installer\fetch-pdfium.ps1` и `pwsh installer\fetch-mesa.ps1` — DLL в корень
+   репозитория (нужен 7-Zip для Mesa).
 1. (если меняли иконку) `python assets\make_icon.py`
 2. `cargo build --release --bin pdfsmith`
 3. `& "<ISCC.exe>" /DAppVersion=0.1.0 installer\pdfsmith.iss`
@@ -17,7 +19,8 @@
 4. Готовый файл: `dist\pdfsmith-setup.exe`
 
 ## Что делает установщик
-- Кладёт `pdfsmith.exe` + `pdfium.dll` + `pdfsmith.ico` в `%LocalAppData%\PDFsmith`
+- Кладёт `pdfsmith.exe` + `pdfium.dll` + `pdfsmith.ico` + программный OpenGL
+  (`opengl32.dll`, `libgallium_wgl.dll`, скачиваются `fetch-mesa.ps1`) в `%LocalAppData%\PDFsmith`
   (без прав администратора).
 - Регистрирует ProgID `PDFsmith.Document` и ассоциацию `.pdf` в HKCU; добавляет
   PDFsmith в «Открыть с помощью» и в «Приложения по умолчанию».

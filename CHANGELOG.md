@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-23
+
+### Исправлено
+
+- Программа не запускалась на ПК без видеокарты или без видеодрайвера
+  («не найден ни один графический адаптер»): в сборку не попадал бэкенд
+  DirectX 12. Теперь порядок такой: видеокарта (DirectX 12 / Vulkan) →
+  программный DirectX 12 (WARP) → встроенный программный OpenGL (Mesa llvmpipe).
+- Вместо аварийного окна — понятное сообщение, если отрисовка недоступна.
+
 ## [0.1.1] - 2026-09-23
 
 ### Добавлено
@@ -29,5 +39,6 @@
   объединение и разделение PDF.
 - Перетаскивание файлов для открытия и вставки страниц.
 
-[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/denfry/pdfsmith/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/denfry/pdfsmith/releases/tag/v0.1.1

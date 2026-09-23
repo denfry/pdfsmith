@@ -31,6 +31,9 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 [Files]
 Source: "..\target\release\pdfsmith.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Программный OpenGL (Mesa llvmpipe): запуск на ПК без видеокарты и драйверов.
+Source: "..\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\crates\pdfsmith-app\assets\pdfsmith.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Tasks]

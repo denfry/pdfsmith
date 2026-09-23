@@ -1,7 +1,7 @@
 //! pdfsmith — просмотр, редактирование и конвертация PDF.
 //!
-//! Тайловый рендер в фоновом потоке PDFium, композиция на GPU (wgpu с
-//! программным WARP-фоллбэком), непрерывная прокрутка всех страниц.
+//! Тайловый рендер в фоновом потоке PDFium, композиция на GPU (wgpu: DX12/Vulkan,
+//! без видеокарты — программный OpenGL Mesa llvmpipe), непрерывная прокрутка всех страниц.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -31,13 +31,26 @@ fn main() {
 
     let path = std::env::args_os().nth(1).map(PathBuf::from);
 
+    let Some(wgpu_setup) = build_wgpu_setup() else {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("pdfsmith — нет графики")
+            .set_description(
+                "Не удалось запустить отрисовку окна: не найден ни видеоадаптер (DirectX 12 / Vulkan), \
+                 ни программный рендер.\n\nПереустановите PDFsmith (в папке программы должны быть \
+                 opengl32.dll и libgallium_wgl.dll) или установите драйвер видеокарты.",
+            )
+            .show();
+        return;
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 840.0])
             .with_min_inner_size([720.0, 480.0])
             .with_title("pdfsmith"),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: build_wgpu_setup(),
+            wgpu_setup,
             ..Default::default()
         },
         ..Default::default()
@@ -64,59 +77,65 @@ fn main() {
     }
 }
 
-/// Создаёт wgpu-устройство: сначала аппаратное (DX12/Vulkan), при отказе —
-/// программный WARP (встроен в Windows, не требует драйверов GPU).
-fn build_wgpu_setup() -> eframe::egui_wgpu::WgpuSetup {
+/// Выбор графического адаптера, по убыванию предпочтения:
+/// 1. аппаратный DX12/Vulkan;
+/// 2. любой адаптер DX12 (в т.ч. программный WARP, если Windows его отдаёт);
+/// 3. программный OpenGL Mesa llvmpipe — `opengl32.dll` + `libgallium_wgl.dll`
+///    кладутся рядом с exe, работает без видеокарты и драйверов.
+///
+/// `PDFSMITH_FORCE_WARP=1` сразу выбирает программный рендер (п. 3).
+/// `None` — не нашлось ничего, вызывающий показывает понятную ошибку.
+fn build_wgpu_setup() -> Option<eframe::egui_wgpu::WgpuSetup> {
     use eframe::wgpu;
     use std::sync::Arc;
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL,
-        ..Default::default()
-    });
+    let force_software = std::env::var_os("PDFSMITH_FORCE_WARP").is_some();
 
-    // PDFSMITH_FORCE_WARP=1 принудительно выбирает программный рендер.
-    let force_warp = std::env::var("PDFSMITH_FORCE_WARP").is_ok();
-    let adapter = pollster::block_on(async {
-        if !force_warp {
-            if let Some(a) = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await
-            {
-                return Some(a);
-            }
-        }
-        instance
-            .enumerate_adapters(wgpu::Backends::all())
-            .into_iter()
-            .min_by_key(|a| match a.get_info().device_type {
-                wgpu::DeviceType::Cpu => 0u8,
-                _ => 1u8,
-            })
-    })
-    .expect("не найден ни один графический адаптер (DX12/Vulkan/WARP)");
+    let hardware = || {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .or_else(|| instance.enumerate_adapters(wgpu::Backends::DX12).into_iter().next())?;
+        Some((instance, adapter))
+    };
 
+    let software = || {
+        // Mesa: выбрать CPU-растеризатор, а не свой драйвер «GL поверх D3D12».
+        // Переменная читается Mesa при создании первого GL-контекста.
+        std::env::set_var("GALLIUM_DRIVER", "llvmpipe");
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let adapter = instance.enumerate_adapters(wgpu::Backends::GL).into_iter().next()?;
+        Some((instance, adapter))
+    };
+
+    let (instance, adapter) = if force_software { software() } else { hardware().or_else(software) }?;
     log::info!("wgpu адаптер: {:?}", adapter.get_info());
 
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("pdfsmith"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             memory_hints: wgpu::MemoryHints::default(),
         },
         None,
     ))
-    .expect("не удалось создать графическое устройство");
+    .map_err(|e| log::error!("не удалось создать графическое устройство: {e}"))
+    .ok()?;
 
-    eframe::egui_wgpu::WgpuSetup::Existing {
+    Some(eframe::egui_wgpu::WgpuSetup::Existing {
         instance: Arc::new(instance),
         adapter: Arc::new(adapter),
         device: Arc::new(device),
         queue: Arc::new(queue),
-    }
+    })
 }

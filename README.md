@@ -63,6 +63,11 @@ cargo build --release
 — `text.pdf` (любой многостраничный PDF с текстовым слоем); без них тесты с
 PDFium пропускаются.
 
+Необязательно, но нужно для ПК без видеокарты: программный OpenGL Mesa
+(`opengl32.dll` + `libgallium_wgl.dll`) рядом с `pdfsmith.exe`. Скачать в корень
+репозитория: `pwsh installeretch-mesa.ps1` (затем скопировать в
+`target/release/`). Установщик кладёт их автоматически.
+
 ```
 cargo test --workspace
 ```
@@ -89,7 +94,7 @@ cargo test --workspace
 
 ## Переменные окружения
 
-- `PDFSMITH_FORCE_WARP=1` — программный рендер вместо GPU.
+- `PDFSMITH_FORCE_WARP=1` — программный рендер (Mesa llvmpipe) вместо GPU.
 - `RUST_LOG=info` — логи в stderr (в debug-сборке).
 
 ## Планы
@@ -100,6 +105,14 @@ cargo test --workspace
 - OCR.
 - Редактирование текста, водяные знаки, колонтитулы, скрытие данных.
 - Конвертация PDF → Word/Excel.
+
+## Сторонние компоненты
+
+- [PDFium](https://pdfium.googlesource.com/pdfium/) — BSD-3-Clause, сборки
+  [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries).
+- [Mesa 3D](https://www.mesa3d.org/) (llvmpipe) — MIT, сборки
+  [pal1000/mesa-dist-win](https://github.com/pal1000/mesa-dist-win); включает
+  LLVM (Apache-2.0 with LLVM Exception).
 
 ## Лицензия
 

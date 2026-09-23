@@ -4,6 +4,9 @@
 # Бинарник PDFium (скачивается отдельно, не версионируется)
 /pdfium.dll
 /pdfium-win-x64.tgz
+# Программный OpenGL Mesa (installer/fetch-mesa.ps1)
+/opengl32.dll
+/libgallium_wgl.dll
 /bin
 /lib
 

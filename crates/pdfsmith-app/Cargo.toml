@@ -16,6 +16,8 @@ pdfsmith-update.workspace = true
 log.workspace = true
 eframe = { version = "0.30.0", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 pollster = "0.4"
+# eframe подключает wgpu без DX12 — включаем явно (единственный путь к WARP на ПК без видеодрайвера).
+wgpu = { version = "23.0.1", default-features = false, features = ["dx12", "wgsl"] }
 env_logger = "0.11.10"
 rfd = { version = "0.17.2", default-features = false }
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp"] }
