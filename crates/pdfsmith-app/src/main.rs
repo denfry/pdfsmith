@@ -14,6 +14,7 @@ mod default_app;
 mod render_thread;
 mod settings;
 mod theme;
+mod updates;
 
 fn main() {
     env_logger::init();
