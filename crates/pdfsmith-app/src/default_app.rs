@@ -45,6 +45,19 @@ pub fn query() -> DefaultStatus {
     DefaultStatus { installed: false, is_default: false }
 }
 
+/// HRESULT_FROM_WIN32(ERROR_CANCELLED), как i32 — пользователь закрыл диалог
+/// выбора кнопкой «Отмена» либо крестиком. Это не ошибка: фолбэк на
+/// ms-settings не нужен.
+#[cfg(windows)]
+const HRESULT_ERROR_CANCELLED: i32 = 0x800704C7u32 as i32;
+
+/// `true`, если `SHOpenWithDialog` можно считать успешным: диалог реально
+/// открылся и либо завершился штатно, либо пользователь его отменил.
+#[cfg(windows)]
+fn picker_succeeded(hresult: i32) -> bool {
+    hresult >= 0 || hresult == HRESULT_ERROR_CANCELLED
+}
+
 /// Системный диалог «Чем открывать .pdf». `false` — диалог не открылся.
 #[cfg(windows)]
 fn show_picker() -> bool {
@@ -62,7 +75,7 @@ fn show_picker() -> bool {
     };
     unsafe {
         CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        SHOpenWithDialog(std::ptr::null_mut(), &info) >= 0
+        picker_succeeded(SHOpenWithDialog(std::ptr::null_mut(), &info))
     }
 }
 
@@ -167,6 +180,14 @@ mod tests {
     use super::*;
 
     const NOT_DEFAULT: DefaultStatus = DefaultStatus { installed: true, is_default: false };
+
+    #[cfg(windows)]
+    #[test]
+    fn picker_succeeded_treats_cancel_as_success() {
+        assert!(picker_succeeded(0)); // S_OK
+        assert!(picker_succeeded(HRESULT_ERROR_CANCELLED), "отмена пользователем — не ошибка");
+        assert!(!picker_succeeded(-2147024809i32), "прочие ошибки — фолбэк на ms-settings");
+    }
 
     #[test]
     fn prompt_only_when_installed_not_default_and_allowed() {

@@ -58,6 +58,7 @@ impl SettingsStore {
         SettingsStore { data: Settings::default(), path: None }
     }
 
+    #[cfg(test)]
     pub fn at(path: PathBuf) -> Self {
         SettingsStore { data: Settings::load(&path), path: Some(path) }
     }

@@ -5,7 +5,7 @@ use eframe::egui::{self, RichText};
 use crate::default_app::DefaultApp;
 use crate::settings::SettingsStore;
 use crate::theme;
-use crate::updates::{UpdateUi, CURRENT_VERSION};
+use crate::updates::{UpdState, UpdateUi, CURRENT_VERSION};
 
 pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut SettingsStore, upd: &mut UpdateUi, def: &mut DefaultApp) {
     if !*open {
@@ -28,14 +28,19 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut Setting
                 upd.set_auto_update(store, auto);
             }
             ui.label(RichText::new(format!("Текущая версия: {CURRENT_VERSION}")).color(theme::MUTED));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(upd.enabled() && !upd.checking, egui::Button::new("Проверить сейчас")).clicked() {
-                    upd.check_now();
-                }
-                if upd.checking {
-                    ui.spinner();
-                }
-            });
+            if upd.enabled() {
+                ui.horizontal(|ui| {
+                    let downloading = matches!(upd.state, UpdState::Downloading { .. });
+                    if ui.add_enabled(!upd.checking && !downloading, egui::Button::new("Проверить сейчас")).clicked() {
+                        upd.check_now();
+                    }
+                    if upd.checking {
+                        ui.spinner();
+                    }
+                });
+            } else {
+                ui.label(RichText::new("Обновления работают в установленной версии программы").color(theme::MUTED));
+            }
             if let Some((msg, err)) = &upd.message {
                 ui.label(RichText::new(msg).color(if *err { theme::DANGER } else { theme::OK }));
             }
