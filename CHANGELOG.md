@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-23
+
 ### Добавлено
 
 - Печать (Ctrl+P, кнопка на панели): окно с выбором принтера и его
@@ -60,6 +62,7 @@
   объединение и разделение PDF.
 - Перетаскивание файлов для открытия и вставки страниц.
 
-[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/denfry/pdfsmith/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/denfry/pdfsmith/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/denfry/pdfsmith/releases/tag/v0.1.1
