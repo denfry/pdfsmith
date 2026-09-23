@@ -37,6 +37,12 @@ PDFium пропускаются.
 cargo test --workspace
 ```
 
+## Установка и обновления
+
+Готовый установщик — `pdfsmith-setup.exe` в
+[Releases](https://github.com/denfry/pdfsmith/releases/latest). Ставится без прав
+администратора; обновления приходят из тех же Releases (см. `installer/README.md`).
+
 ## Структура
 
 - `crates/pdfsmith-pdfium` — тонкая обёртка над сырыми `FPDF_*`: рендер

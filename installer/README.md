@@ -32,3 +32,21 @@
 Тихая установка раскладывает файлы и ключи HKCU (ProgID `shell\open\command`,
 Capabilities/RegisteredApplications, `.pdf\OpenWithProgids` = `PDFsmith.Document`);
 деинсталляция удаляет файлы, папку и все ключи без остатка.
+
+## Выпуск новой версии (автоматически через GitHub Actions)
+1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml`, `cargo build`
+   (обновит `Cargo.lock`), закоммитить.
+2. `git tag -a v1.2.3 -m "Что нового: ..."` — текст тега станет описанием релиза
+   и показывается в приложении по ссылке «Что нового».
+3. `git push --follow-tags`.
+4. Workflow **Release** проверит версию, соберёт и опубликует Release с
+   `pdfsmith-setup.exe`, `pdfsmith-setup.exe.sha256` и `latest.json`.
+
+## Как приложение обновляется
+- Раз в 12 часов (и по кнопке «Проверить сейчас» в настройках) читает
+  `releases/latest/download/latest.json`.
+- По умолчанию показывает плашку «Доступна версия …»; с включённым
+  «Автоматически устанавливать обновления» качает в фоне и ставит при закрытии.
+- Перед запуском установщика сверяет SHA-256. Установщик запускается тихо:
+  `pdfsmith-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART [/RELAUNCH]`.
+- Если открыты другие окна PDFsmith, установка откладывается до следующего закрытия.
