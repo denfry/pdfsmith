@@ -189,3 +189,64 @@ fn rename_failure_leaves_no_part() {
     let lefts = leftovers(&dir);
     assert!(!lefts.iter().any(|f| f.ends_with(".part")), "leftover .part file: {:?}", lefts);
 }
+
+use std::time::Duration;
+
+use pdfsmith_update::{Command, Config, UpdateEvent};
+
+fn worker_config(base: &str, current: &str, dir: PathBuf) -> Config {
+    Config {
+        current_version: current.into(),
+        manifest_url: format!("{base}/latest.json"),
+        allowed_prefix: format!("{base}/"),
+        updates_dir: dir,
+    }
+}
+
+fn latest_json(base: &str) -> String {
+    format!(r#"{{"version":"9.9.9","notes":"n","url":"{base}/setup.exe","sha256":"{}"}}"#, sha256_hex(&body()))
+}
+
+#[test]
+fn worker_check_then_download() {
+    let (l, base) = bind();
+    serve(l, vec![route("/latest.json", latest_json(&base)), route("/setup.exe", body())]);
+    let h = pdfsmith_update::spawn(worker_config(&base, "0.1.0", tmpdir("worker")), Box::new(|| {}));
+    h.cmd_tx.send(Command::Check { quiet: false }).unwrap();
+    let manifest = match h.event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        UpdateEvent::Available { manifest, quiet: false } => manifest,
+        other => panic!("ожидали Available, получили {other:?}"),
+    };
+    h.cmd_tx.send(Command::Download { manifest, quiet: false }).unwrap();
+    loop {
+        match h.event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            UpdateEvent::Progress { .. } => continue,
+            UpdateEvent::Ready { path, .. } => {
+                assert_eq!(std::fs::read(path).unwrap(), body());
+                break;
+            }
+            other => panic!("ожидали Ready, получили {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn worker_reports_up_to_date() {
+    let (l, base) = bind();
+    serve(l, vec![route("/latest.json", latest_json(&base))]);
+    let h = pdfsmith_update::spawn(worker_config(&base, "9.9.9", tmpdir("uptodate")), Box::new(|| {}));
+    h.cmd_tx.send(Command::Check { quiet: true }).unwrap();
+    assert!(matches!(h.event_rx.recv_timeout(Duration::from_secs(10)).unwrap(), UpdateEvent::UpToDate { quiet: true }));
+}
+
+#[test]
+fn worker_reports_network_failure() {
+    let (l, base) = bind();
+    serve(l, vec![]);
+    let h = pdfsmith_update::spawn(worker_config(&base, "0.1.0", tmpdir("fail")), Box::new(|| {}));
+    h.cmd_tx.send(Command::Check { quiet: true }).unwrap();
+    match h.event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        UpdateEvent::Failed { quiet: true, cancelled: false, .. } => {}
+        other => panic!("ожидали Failed, получили {other:?}"),
+    }
+}
