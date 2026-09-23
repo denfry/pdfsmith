@@ -32,6 +32,12 @@ impl Manifest {
         if !self.url.starts_with(allowed_prefix) || self.url.contains("..") {
             return Err(Error::BadManifest(format!("недопустимый адрес загрузки: {}", self.url)));
         }
+        // Whitelist: ASCII letters, digits, and -._~/:
+        if !self.url.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':')
+        }) {
+            return Err(Error::BadManifest(format!("недопустимый адрес загрузки: {}", self.url)));
+        }
         if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::BadManifest("sha256 должен состоять из 64 hex-символов".into()));
         }
@@ -80,6 +86,10 @@ mod tests {
             "https://github.com/denfry/pdfsmith-evil/releases/download/v1/x.exe",
             "http://github.com/denfry/pdfsmith/releases/download/v1/x.exe",
             "https://github.com/denfry/pdfsmith/releases/download/v1/../../../other/x.exe",
+            "https://github.com/denfry/pdfsmith/releases/download/v1/%2e%2e/%2e%2e/other/x.exe",
+            "https://github.com/denfry/pdfsmith/releases/download/v1/..\\..\\x.exe",
+            "https://github.com/denfry/pdfsmith/releases/download/v1/x.exe?u=@evil",
+            "https://github.com/denfry/pdfsmith/releases/download/v1/x y.exe",
         ] {
             let r = Manifest::parse(&json("1.2.3", url, HASH), ALLOWED_PREFIX);
             assert!(matches!(r, Err(Error::BadManifest(_))), "{url} должен быть отклонён");
