@@ -37,6 +37,10 @@ jobs:
         shell: pwsh
         run: ./installer/fetch-pdfium.ps1
 
+      - name: Mesa (программный OpenGL)
+        shell: pwsh
+        run: ./installer/fetch-mesa.ps1
+
       - name: Тесты
         run: cargo test --workspace
 
