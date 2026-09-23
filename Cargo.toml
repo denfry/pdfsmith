@@ -4,6 +4,7 @@ members = [
     "crates/pdfsmith-pdfium",
     "crates/pdfsmith-engine",
     "crates/pdfsmith-app",
+    "crates/pdfsmith-update",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ rust-version = "1.80"
 [workspace.dependencies]
 pdfsmith-pdfium = { path = "crates/pdfsmith-pdfium" }
 pdfsmith-engine = { path = "crates/pdfsmith-engine" }
+pdfsmith-update = { path = "crates/pdfsmith-update" }
 thiserror = "2"
 log = "0.4"
 
