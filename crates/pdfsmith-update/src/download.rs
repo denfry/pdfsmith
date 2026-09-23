@@ -54,7 +54,11 @@ pub fn sha256_file(path: &Path) -> Result<String, Error> {
 }
 
 pub fn fetch_manifest(agent: &ureq::Agent, url: &str, allowed_prefix: &str) -> Result<Manifest, Error> {
-    let body = agent.get(url).call().map_err(net)?.into_string().map_err(net)?;
+    let resp = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::Status(404, _) => Error::NoRelease,
+        e => net(e),
+    })?;
+    let body = resp.into_string().map_err(net)?;
     Manifest::parse(&body, allowed_prefix)
 }
 

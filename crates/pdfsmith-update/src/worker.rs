@@ -77,7 +77,7 @@ fn run(cfg: Config, cmd_rx: Receiver<Command>, ev_tx: Sender<UpdateEvent>, cance
                 Ok(m) if decide::is_newer(&cfg.current_version, &m.version) => send(UpdateEvent::Available { manifest: m, quiet }),
                 Ok(_) => send(UpdateEvent::UpToDate { quiet }),
                 Err(e) => {
-                    log::warn!("проверка обновлений: {e}");
+                    log::warn!("проверка обновлений: {e:?}");
                     send(UpdateEvent::Failed { quiet, error: e.to_string(), cancelled: false });
                 }
             },
@@ -93,7 +93,7 @@ fn run(cfg: Config, cmd_rx: Receiver<Command>, ev_tx: Sender<UpdateEvent>, cance
                 match download::download(&agent, &manifest, &cfg.updates_dir, &cancel, &mut progress) {
                     Ok(path) => send(UpdateEvent::Ready { manifest, path }),
                     Err(e) => {
-                        log::warn!("загрузка обновления {}: {e}", manifest.version);
+                        log::warn!("загрузка обновления {}: {e:?}", manifest.version);
                         send(UpdateEvent::Failed { quiet, cancelled: matches!(e, Error::Cancelled), error: e.to_string() });
                     }
                 }

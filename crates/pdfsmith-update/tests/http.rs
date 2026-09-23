@@ -154,7 +154,7 @@ fn fetch_manifest_ok_and_404() {
     let m = download::fetch_manifest(&agent, &format!("{base}/latest.json"), &prefix).unwrap();
     assert_eq!(m.version, "9.9.9");
     let r = download::fetch_manifest(&agent, &format!("{base}/missing.json"), &prefix);
-    assert!(matches!(r, Err(Error::Network(_))), "{r:?}");
+    assert!(matches!(r, Err(Error::NoRelease)), "{r:?}");
 }
 
 #[test]

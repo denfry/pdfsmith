@@ -1,6 +1,6 @@
 //! Обновления в UI: плашка над документом, фоновые загрузки, решение при выходе.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use eframe::egui::{self, RichText};
@@ -11,6 +11,19 @@ use crate::settings::SettingsStore;
 use crate::theme::{self, icon_button};
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `exe_dir` — это установленное расположение `%LOCALAPPDATA%\PDFsmith`?
+/// Портативный/dev-запуск (любая другая папка) не должен трогать сеть и
+/// ставить обновления в профиль пользователя. Сравнение без учёта регистра,
+/// после канонизации там, где обе стороны существуют.
+pub fn is_installed_location(exe_dir: &Path, local_appdata: &Path) -> bool {
+    let installed = local_appdata.join("PDFsmith");
+    let (a, b) = match (exe_dir.canonicalize(), installed.canonicalize()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => (exe_dir.to_path_buf(), installed),
+    };
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdState {
@@ -39,7 +52,16 @@ impl UpdateUi {
     }
 
     /// Боевой режим: поток `updater`, фоновая проверка при запуске (раз в 12 ч).
+    /// Портативный/dev-запуск обновления не проверяет (см. `is_installed_location`).
     pub fn new(ctx: &egui::Context, store: &SettingsStore) -> Self {
+        let installed = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .zip(std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+            .is_some_and(|(exe_dir, local_appdata)| is_installed_location(&exe_dir, &local_appdata));
+        if !installed {
+            return Self::with_handle(None);
+        }
         let handle = Config::github(CURRENT_VERSION).map(|cfg| {
             let ctx = ctx.clone();
             pdfsmith_update::spawn(cfg, Box::new(move || ctx.request_repaint()))
@@ -87,12 +109,13 @@ impl UpdateUi {
         match ev {
             UpdateEvent::Available { manifest, quiet } => {
                 self.checking = false;
-                store.data.last_check = Some(decide::now_secs());
-                store.save();
                 if matches!(self.state, UpdState::Downloading { .. } | UpdState::Ready { .. }) {
                     return;
                 }
                 if !decide::should_offer(CURRENT_VERSION, &manifest.version, store.data.skipped_version.as_deref(), !quiet) {
+                    // Нечего предложить — как будто и не было обновления.
+                    store.data.last_check = Some(decide::now_secs());
+                    store.save();
                     return;
                 }
                 if !quiet {
@@ -100,7 +123,7 @@ impl UpdateUi {
                     self.banner_hidden = false;
                 }
                 if store.data.auto_update {
-                    self.start_download(manifest, true);
+                    self.start_download(manifest, quiet);
                 } else {
                     self.state = UpdState::Available(manifest);
                 }
@@ -155,6 +178,7 @@ impl UpdateUi {
     pub fn skip(&mut self, store: &mut SettingsStore) {
         if let UpdState::Available(m) = &self.state {
             store.data.skipped_version = Some(m.version.clone());
+            store.data.last_check = Some(decide::now_secs());
             store.save();
             self.state = UpdState::Idle;
         }
@@ -327,13 +351,77 @@ mod tests {
     }
 
     #[test]
-    fn quiet_check_shows_banner_and_records_check_time() {
+    fn is_installed_location_matches_case_insensitively() {
+        let dir = std::env::temp_dir().join(format!("pdfsmith-installed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let local_appdata = dir.join("LocalAppData");
+        let installed = local_appdata.join("PDFsmith");
+        std::fs::create_dir_all(&installed).unwrap();
+        let differently_cased = local_appdata.join("PDFSMITH");
+        assert!(is_installed_location(&installed, &local_appdata));
+        assert!(is_installed_location(&differently_cased, &local_appdata), "регистр не должен иметь значения");
+    }
+
+    #[test]
+    fn is_installed_location_rejects_other_dir() {
+        let dir = std::env::temp_dir().join(format!("pdfsmith-not-installed-{}", std::process::id()));
+        let local_appdata = dir.join("LocalAppData");
+        let other = dir.join("Portable");
+        assert!(!is_installed_location(&other, &local_appdata));
+    }
+
+    #[test]
+    fn quiet_check_shows_banner_and_does_not_record_check_time() {
+        // Обновление предложено, но ещё не поставлено — на следующем запуске
+        // его нужно предложить снова, поэтому `last_check` не трогаем.
         let mut r = rig("banner");
         r.push(UpdateEvent::Available { manifest: m("999.0.0"), quiet: true });
         assert_eq!(r.ui.state, UpdState::Available(m("999.0.0")));
         assert!(r.ui.banner_visible(&r.store));
-        assert!(Settings::load(&r.path).last_check.is_some());
+        assert!(Settings::load(&r.path).last_check.is_none());
         assert!(r.cmds.try_recv().is_err(), "без автообновления ничего не качаем");
+    }
+
+    #[test]
+    fn up_to_date_records_check_time() {
+        let mut r = rig("uptodate-check-time");
+        r.push(UpdateEvent::UpToDate { quiet: true });
+        assert!(Settings::load(&r.path).last_check.is_some());
+    }
+
+    #[test]
+    fn nothing_to_offer_records_check_time() {
+        // Версия старее текущей или пропущенная — предлагать нечего, но
+        // проверка состоялась, так что `last_check` обновляем.
+        let mut r = rig("nothing-to-offer");
+        r.push(UpdateEvent::Available { manifest: m("0.0.1"), quiet: true });
+        assert!(Settings::load(&r.path).last_check.is_some());
+    }
+
+    #[test]
+    fn skip_records_check_time() {
+        let mut r = rig("skip-check-time");
+        r.push(UpdateEvent::Available { manifest: m("999.0.0"), quiet: true });
+        assert!(Settings::load(&r.path).last_check.is_none());
+        r.ui.skip(&mut r.store);
+        assert!(Settings::load(&r.path).last_check.is_some());
+    }
+
+    #[test]
+    fn auto_mode_manual_check_downloads_not_quietly() {
+        // F4: ручная проверка «Проверить сейчас» в режиме автообновления —
+        // ошибка загрузки должна быть видна, раз пользователь сам её запросил.
+        let mut r = rig("auto-manual");
+        r.ui.set_auto_update(&mut r.store, true);
+        let _ = r.cmds.try_recv();
+        r.push(UpdateEvent::Available { manifest: m("999.0.0"), quiet: false });
+        match r.cmds.try_recv() {
+            Ok(Command::Download { manifest, quiet }) => {
+                assert_eq!(manifest.version, "999.0.0");
+                assert!(!quiet, "ручная проверка не должна качать тихо");
+            }
+            other => panic!("ожидали Download, получили {other:?}"),
+        }
     }
 
     #[test]
