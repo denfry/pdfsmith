@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod manifest;
+pub mod decide;
 
 pub use error::Error;
 pub use manifest::Manifest;
