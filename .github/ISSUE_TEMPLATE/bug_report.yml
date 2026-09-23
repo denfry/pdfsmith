@@ -1,0 +1,66 @@
+name: Отчёт об ошибке
+description: Сообщить о неправильной работе PDFsmith
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Версия PDFsmith
+      description: Настройки → «О программе» (или аналогичный раздел)
+      placeholder: например, 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Версия Windows
+      placeholder: например, Windows 11 23H2
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      description: Как повторить проблему
+      placeholder: |
+        1. Открыть файл ...
+        2. Нажать ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактическое поведение
+    validations:
+      required: true
+  - type: dropdown
+    id: pdf-specific
+    attributes:
+      label: Проблема воспроизводится на конкретном PDF?
+      options:
+        - "Нет, на любых файлах"
+        - "Да, только на определённом файле"
+        - "Не проверял(а)"
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Если проблема связана с конкретным PDF — **не прикладывайте
+        конфиденциальные документы**. По возможности опишите структуру файла
+        или приложите обезличенный пример.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи (необязательно)
+      description: Вывод с `RUST_LOG=info`, если есть
+      render: text
+    validations:
+      required: false

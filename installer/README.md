@@ -38,10 +38,11 @@ Capabilities/RegisteredApplications, `.pdf\OpenWithProgids` = `PDFsmith.Document
 ## Выпуск новой версии (автоматически через GitHub Actions)
 1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml`, `cargo build`
    (обновит `Cargo.lock`), закоммитить.
-2. `git tag -a v1.2.3 -m "Что нового: ..."` — текст тега станет описанием релиза
+2. Добавить запись в CHANGELOG.md.
+3. `git tag -a v1.2.3 -m "Что нового: ..."` — текст тега станет описанием релиза
    и показывается в приложении по ссылке «Что нового».
-3. `git push --follow-tags`.
-4. Workflow **Release** проверит версию, соберёт и опубликует Release с
+4. `git push --follow-tags`.
+5. Workflow **Release** проверит версию, соберёт и опубликует Release с
    `pdfsmith-setup.exe`, `pdfsmith-setup.exe.sha256` и `latest.json`.
 
 ## Как приложение обновляется
