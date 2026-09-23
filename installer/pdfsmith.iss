@@ -1,12 +1,17 @@
 ; PDFsmith — per-user установщик (без прав администратора)
 #define AppName "PDFsmith"
-#define AppVersion "0.1.0"
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
 #define ProgId "PDFsmith.Document"
 
 [Setup]
 AppId={{8F3B6A2C-1D4E-4C7A-9B12-A1B2C3D4E5F6}
 AppName={#AppName}
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppVersion}
+CloseApplications=force
+RestartApplications=no
 AppPublisher=PDFsmith
 DefaultDirName={localappdata}\{#AppName}
 DefaultGroupName={#AppName}
@@ -50,6 +55,14 @@ Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueN
 ; --- OpenWithProgids ---
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue
 
+[Run]
+Filename: "{app}\pdfsmith.exe"; Description: "Запустить PDFsmith"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\pdfsmith.exe"; Flags: nowait skipifnotsilent; Check: ShouldRelaunch
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\cache"
+Type: filesandordirs; Name: "{app}\updates"
+
 [Code]
 const
   OAIF_ALLOW_REGISTRATION = $00000001;
@@ -66,12 +79,23 @@ type
 function SHOpenWithDialog(hwndParent: Integer; var poainfo: TOpenAsInfo): Integer;
   external 'SHOpenWithDialog@shell32.dll stdcall';
 
+// Перезапуск после тихого обновления из приложения: pdfsmith-setup.exe /VERYSILENT /RELAUNCH
+function ShouldRelaunch: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+      Result := True;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Info: TOpenAsInfo;
   ErrorCode: Integer;
 begin
-  if (CurStep = ssPostInstall) and WizardIsTaskSelected('setdefault') then
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('setdefault') and not WizardSilent then
   begin
     Info.pcszFile := '';
     Info.pcszClass := '.pdf';
