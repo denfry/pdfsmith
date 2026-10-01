@@ -240,10 +240,10 @@ impl PrintDialog {
                             if self.duplex != Duplex::Simplex {
                                 s += &format!(" · листов: {}", self.copies.max(1) as usize * p.len().div_ceil(2));
                             }
-                            ui.label(egui::RichText::new(s).color(theme::MUTED));
+                            ui.label(egui::RichText::new(s).color(theme::muted()));
                         }
                         Err(e) => {
-                            ui.label(egui::RichText::new(format!("{}  {e}", ph::WARNING)).color(theme::DANGER));
+                            ui.label(egui::RichText::new(format!("{}  {e}", ph::WARNING)).color(theme::danger()));
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -251,8 +251,7 @@ impl PrintDialog {
                             close = true;
                         }
                         let ready = pages.is_ok() && !self.printer.is_empty() && !doc.busy;
-                        let btn = egui::Button::new(egui::RichText::new(format!("{}  Печать", ph::PRINTER)).color(if ready { Color32::BLACK } else { theme::MUTED }))
-                            .fill(if ready { theme::ACCENT } else { theme::LINE })
+                        let btn = theme::primary_button(format!("{}  Печать", ph::PRINTER), ready)
                             .min_size(Vec2::new(110.0, 28.0));
                         let resp = ui.add_enabled(ready, btn);
                         let resp = if doc.busy { resp.on_disabled_hover_text("Дождитесь окончания текущей печати") } else { resp };
@@ -298,7 +297,7 @@ impl PrintDialog {
 
     fn settings_ui(&mut self, ui: &mut egui::Ui, doc: &DocInfo, pages: &Result<Vec<usize>, String>) {
         let label = |ui: &mut egui::Ui, s: &str| {
-            ui.label(egui::RichText::new(s).color(theme::MUTED));
+            ui.label(egui::RichText::new(s).color(theme::muted()));
         };
         let mut devmode_dirty = false;
         egui::Grid::new("print_grid").num_columns(2).spacing([14.0, 9.0]).min_col_width(96.0).show(ui, |ui| {
@@ -306,7 +305,7 @@ impl PrintDialog {
             label(ui, "Принтер");
             ui.horizontal(|ui| {
                 if self.printers.is_empty() {
-                    ui.label(egui::RichText::new("Принтеры не найдены").color(theme::DANGER));
+                    ui.label(egui::RichText::new("Принтеры не найдены").color(theme::danger()));
                 } else {
                     let mut chosen = None;
                     egui::ComboBox::from_id_salt("printer")
@@ -346,7 +345,7 @@ impl PrintDialog {
                     s = format!("{n} · {s}");
                 }
                 s += &format!(" · {:.0} dpi", p.dpi_x.min(p.dpi_y));
-                ui.label(egui::RichText::new(s).small().color(theme::MUTED));
+                ui.label(egui::RichText::new(s).small().color(theme::muted()));
                 ui.end_row();
             }
 
@@ -364,7 +363,7 @@ impl PrintDialog {
                     }
                 });
                 if let (PageSet::Range, Err(e)) = (self.page_set, pages) {
-                    ui.label(egui::RichText::new(e).small().color(theme::DANGER));
+                    ui.label(egui::RichText::new(e).small().color(theme::danger()));
                 }
             });
             ui.end_row();
@@ -496,12 +495,12 @@ impl PrintDialog {
     fn preview_ui(&mut self, ui: &mut egui::Ui, doc: &DocInfo, pages: &Result<Vec<usize>, String>) {
         let (area, _) = ui.allocate_exact_size(PREVIEW_BOX, egui::Sense::hover());
         let painter = ui.painter_at(area);
-        painter.rect_filled(area, 4.0, theme::BG);
+        painter.rect_filled(area, 4.0, theme::bg());
 
         let paper = self.paper.unwrap_or_else(Paper::a4);
         let k = ((area.width() - 28.0) / paper.width).min((area.height() - 28.0) / paper.height);
         let sheet = Rect::from_center_size(area.center(), Vec2::new(paper.width, paper.height) * k);
-        painter.rect_filled(sheet.translate(Vec2::new(0.0, 3.0)), 0.0, Color32::from_black_alpha(90));
+        painter.rect_filled(sheet.translate(Vec2::new(0.0, 3.0)), 0.0, theme::shadow());
         painter.rect_filled(sheet, 0.0, Color32::WHITE);
         let to_screen = |x: f32, y: f32| sheet.min + Vec2::new(x, y) * k;
         let a = paper.area;
@@ -511,7 +510,7 @@ impl PrintDialog {
         }
 
         let Ok(list) = pages else {
-            painter.text(sheet.center(), egui::Align2::CENTER_CENTER, ph::WARNING, egui::FontId::proportional(28.0), theme::DANGER);
+            painter.text(sheet.center(), egui::Align2::CENTER_CENTER, ph::WARNING, egui::FontId::proportional(28.0), theme::danger());
             return;
         };
         let page = list[self.sheet.min(list.len() - 1)];
@@ -557,7 +556,7 @@ impl PrintDialog {
             }
             ui.add_sized(
                 [120.0, 24.0],
-                egui::Label::new(egui::RichText::new(format!("стр. {}  ·  {} из {n}", page + 1, self.sheet + 1)).color(theme::MUTED)),
+                egui::Label::new(egui::RichText::new(format!("стр. {}  ·  {} из {n}", page + 1, self.sheet + 1)).color(theme::muted())),
             );
             if ui.add_enabled(self.sheet + 1 < n, egui::Button::new(ph::CARET_RIGHT).min_size(Vec2::new(28.0, 24.0))).clicked() {
                 self.sheet += 1;

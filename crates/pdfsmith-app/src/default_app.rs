@@ -148,7 +148,7 @@ impl DefaultApp {
 
     pub fn banner(&mut self, ui: &mut egui::Ui, store: &mut SettingsStore) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(ph::FILE_PDF).size(theme::ICON).color(theme::ACCENT));
+            ui.label(RichText::new(ph::FILE_PDF).size(theme::ICON).color(theme::accent()));
             ui.label("Сделать PDFsmith программой для PDF по умолчанию?");
             if ui.add_enabled(!self.picker_open(), egui::Button::new("Сделать")).clicked() {
                 self.open_picker(ui.ctx());
@@ -166,9 +166,9 @@ impl DefaultApp {
 
     pub fn settings_section(&mut self, ui: &mut egui::Ui) {
         if !self.status.installed {
-            ui.label(RichText::new("Доступно после установки программы").color(theme::MUTED));
+            ui.label(RichText::new("Доступно после установки программы").color(theme::muted()));
         } else if self.status.is_default {
-            ui.label(RichText::new(format!("{}  PDFsmith — программа по умолчанию для PDF", ph::CHECK)).color(theme::OK));
+            ui.label(RichText::new(format!("{}  PDFsmith — программа по умолчанию для PDF", ph::CHECK)).color(theme::ok()));
         } else if ui.add_enabled(!self.picker_open(), egui::Button::new("Сделать по умолчанию")).clicked() {
             self.open_picker(ui.ctx());
         }

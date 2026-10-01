@@ -27,7 +27,10 @@ use crate::updates::{UpdState, UpdateUi};
 
 const MIN_LOD: i32 = -4;
 const MAX_LOD: i32 = 8;
-const TEXTURE_CAP: usize = 600;
+/// Тайл 512² ≈ 1 МБ видеопамяти.
+const TEXTURE_CAP: usize = 160;
+/// Сколько тайлов загружать в GPU за кадр (пачка из дискового кэша не даёт рывка).
+const TILE_UPLOADS_PER_FRAME: usize = 24;
 const ZOOM_STEP: f32 = 1.25;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 64.0;
@@ -253,6 +256,42 @@ mod tests {
         cond(app)
     }
 
+    /// Регрессия: контекстное меню страницы не должно закрываться и мигать,
+    /// когда курсор уходит с холста на само меню.
+    #[test]
+    fn headless_context_menu_stays_open_under_cursor() {
+        let _serial = crate::render_thread::pdfium_test_lock();
+        let Some((ctx, mut app)) = headless() else { return };
+        assert!(wait(&ctx, &mut app, 15.0, |a| a.opened), "документ не открылся: {:?}", app.error);
+        assert!(wait(&ctx, &mut app, 15.0, |a| !a.textures.is_empty()), "тайлы не пришли");
+        let r = app.page_screen_rect(app.current_page);
+        let at = r.center();
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        pump(&ctx, &mut app, vec![egui::Event::PointerMoved(at)]);
+        pump(&ctx, &mut app, vec![press(true)]);
+        pump(&ctx, &mut app, vec![press(false)]);
+        pump(&ctx, &mut app, Vec::new());
+        assert_eq!(app.menu_page, Some(app.current_page), "меню не открылось");
+        // Курсор над меню (оно раскрывается вправо-вниз от точки щелчка).
+        let inside = at + Vec2::new(60.0, 40.0);
+        pump(&ctx, &mut app, vec![egui::Event::PointerMoved(inside)]);
+        for frame in 0..6 {
+            pump(&ctx, &mut app, Vec::new());
+            let layer = ctx.layer_id_at(inside).map(|l| l.order);
+            assert_eq!(layer, Some(egui::Order::Foreground), "кадр {frame}: меню пропало из-под курсора");
+        }
+        // Escape закрывает меню и сбрасывает страницу.
+        pump(&ctx, &mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        pump(&ctx, &mut app, Vec::new());
+        pump(&ctx, &mut app, Vec::new());
+        assert_eq!(app.menu_page, None);
+    }
+
     /// Регрессия: после штриха карандашом страницы не должны оставаться белыми —
     /// тайлы обязаны перерисоваться с новым поколением.
     #[test]
@@ -429,6 +468,9 @@ pub struct ViewerApp {
     thumb_requested: HashSet<(usize, u8)>,
     thumb_inflight: usize,
     sidebar_page: Option<usize>,
+    /// Видимые тайлы ещё не дорисованы: миниатюры ждут, чтобы не занимать
+    /// рендер-поток (миниатюра — полный непрерываемый рендер страницы).
+    view_pending: bool,
     // Поиск.
     search_text: String,
     search_query: String,
@@ -448,6 +490,8 @@ pub struct ViewerApp {
     status: Option<(String, Instant, bool)>,
     progress: Option<(String, f32)>,
     cursor_pt: Option<(usize, f32, f32)>,
+    /// Страница, для которой открыто контекстное меню холста.
+    menu_page: Option<usize>,
     // Настройки, обновления, «по умолчанию».
     store: SettingsStore,
     upd: UpdateUi,
@@ -461,6 +505,7 @@ impl ViewerApp {
         let mut app = Self::with_context(cc.egui_ctx.clone(), dll_dir, path);
         // Боевые настройки, сеть и реестр — только в настоящем окне, не в тестах.
         app.store = SettingsStore::load_default();
+        theme::set_choice(&cc.egui_ctx, app.store.data.theme);
         app.upd = UpdateUi::new(&cc.egui_ctx, &app.store);
         app.def_app = DefaultApp::detect();
         app
@@ -501,6 +546,8 @@ impl ViewerApp {
             thumb_requested: HashSet::new(),
             thumb_inflight: 0,
             sidebar_page: None,
+            view_pending: true,
+            menu_page: None,
             search_text: String::new(),
             search_query: String::new(),
             hits: Vec::new(),
@@ -627,7 +674,13 @@ impl ViewerApp {
     // События из рендер-потока
 
     fn poll_events(&mut self, ctx: &egui::Context) {
-        while let Ok(ev) = self.handle.event_rx.try_recv() {
+        let mut uploads = 0;
+        loop {
+            if uploads >= TILE_UPLOADS_PER_FRAME {
+                ctx.request_repaint();
+                break;
+            }
+            let Ok(ev) = self.handle.event_rx.try_recv() else { break };
             match ev {
                 Event::Opened { path, page_sizes } => {
                     self.page_sizes = page_sizes;
@@ -635,6 +688,7 @@ impl ViewerApp {
                     self.opened = true;
                     self.dirty = false;
                     self.current_page = 0;
+                    self.view_pending = true;
                     self.rebuild_layout();
                     self.view.needs_fit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
@@ -671,7 +725,9 @@ impl ViewerApp {
                     if rotation != self.rotation || gen != self.gen || page >= self.page_count() {
                         continue;
                     }
-                    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                    uploads += 1;
+                    // Тайлы непрозрачны (рендер на белом), premultiplied == unmultiplied, но вдвое дешевле.
+                    let image = egui::ColorImage::from_rgba_premultiplied([width as usize, height as usize], &rgba);
                     let name = format!("p{page}_r{rotation}_{lod}_{col}_{row}");
                     let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
                     let key = (page, rotation, lod, col, row);
@@ -685,7 +741,7 @@ impl ViewerApp {
                     if rotation != self.rotation || gen != self.gen {
                         continue;
                     }
-                    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                    let image = egui::ColorImage::from_rgba_premultiplied([width as usize, height as usize], &rgba);
                     let tex = ctx.load_texture(format!("thumb{page}_{rotation}"), image, egui::TextureOptions::LINEAR);
                     self.thumbs.insert((page, rotation), tex);
                 }
@@ -1278,11 +1334,13 @@ impl ViewerApp {
         Rect::from_min_size(base + origin_pt * self.view.zoom, size_pt * self.view.zoom)
     }
 
-    fn draw_page_tiles(&self, painter: &egui::Painter, canvas: Rect, page: usize, current_lod: i32) {
+    /// Рисует готовые тайлы страницы; нарисованные ключи — в `drawn` (их не вытесняем).
+    /// Берём и более резкие LOD (после отдаления они ещё годятся, пока нет своих).
+    fn draw_page_tiles(&self, painter: &egui::Painter, canvas: Rect, page: usize, current_lod: i32, drawn: &mut Vec<TexKey>) {
         let mut keys: Vec<&TexKey> = self
             .textures
             .keys()
-            .filter(|(p, rot, lod, _, _)| *p == page && *rot == self.rotation && *lod <= current_lod)
+            .filter(|(p, rot, lod, _, _)| *p == page && *rot == self.rotation && *lod <= current_lod + 2)
             .collect();
         // Устаревшие снизу, затем грубые, резкие поверх.
         keys.sort_by_key(|k| (!self.stale.contains(*k), k.2));
@@ -1292,6 +1350,7 @@ impl ViewerApp {
             let rect = self.tile_screen_rect(page, lod, col, row, tex.size());
             if rect.intersects(canvas) {
                 painter.image(tex.id(), rect, uv, Color32::WHITE);
+                drawn.push((page, self.rotation, lod, col, row));
             }
         }
     }
@@ -1387,7 +1446,7 @@ impl ViewerApp {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let canvas = response.rect;
-        painter.rect_filled(canvas, 0.0, theme::CANVAS);
+        painter.rect_filled(canvas, 0.0, theme::canvas());
 
         if self.view.needs_fit {
             self.view.needs_fit = false;
@@ -1410,10 +1469,17 @@ impl ViewerApp {
         }
         self.cursor_pt = response.hover_pos().and_then(|p| self.page_at(p));
 
-        // Контекстное меню страницы.
-        if let Some((page, _, _)) = response.hover_pos().and_then(|p| self.page_at(p)) {
+        // Контекстное меню страницы. Страницу запоминаем в момент ПКМ: пока курсор
+        // над самим меню, холст не под курсором, и меню должно рисоваться дальше.
+        if response.secondary_clicked() {
+            self.menu_page = response.interact_pointer_pos().and_then(|p| self.page_at(p)).map(|(page, _, _)| page);
+        }
+        if let Some(page) = self.menu_page {
             let mut ops = Vec::new();
             response.context_menu(|ui| self.page_menu(ui, page, &mut ops));
+            if !response.context_menu_opened() {
+                self.menu_page = None;
+            }
             for op in ops {
                 self.edit(op);
             }
@@ -1427,6 +1493,7 @@ impl ViewerApp {
         let mut visible_pages = Vec::new();
         let mut per_page = Vec::new();
         let mut protected = HashSet::new();
+        let mut drawn = Vec::new();
         for i in 0..self.layout.rects.len() {
             let r = self.page_screen_rect(i);
             if !r.intersects(prefetch) {
@@ -1434,7 +1501,7 @@ impl ViewerApp {
             }
             visible_pages.push(i);
             // Подложка и тень страницы.
-            painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)).expand(1.0), 0.0, Color32::from_black_alpha(70));
+            painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)).expand(1.0), 0.0, theme::shadow());
             painter.rect_filled(r, 0.0, Color32::WHITE);
             let rel = r.min - prefetch.min;
             let tiles: Vec<(u32, u32)> = visible_tiles_center_out(
@@ -1452,11 +1519,12 @@ impl ViewerApp {
                 protected.insert((i, self.rotation, lod, c, rr));
             }
             per_page.push((i, tiles));
-            self.draw_page_tiles(&painter, canvas, i, lod);
+            self.draw_page_tiles(&painter, canvas, i, lod, &mut drawn);
         }
         // Текущую страницу — первой в очередь.
         per_page.sort_by_key(|(p, _)| (*p as i64 - self.current_page as i64).abs());
         self.request_visible(lod, lod_scale, per_page);
+        protected.extend(drawn);
         self.evict(&protected);
         // Призрак нужен, пока видимые тайлы его страницы не пришли свежими
         // (при любом LOD: после смены масштаба новых тайлов ещё нет вовсе).
@@ -1477,12 +1545,18 @@ impl ViewerApp {
             })
             .unwrap_or_default();
         self.ghosts.retain(|g| !g.armed || unfinished.contains(&g.page));
+        let busy = !unfinished.is_empty();
+        if self.view_pending && !busy {
+            // Боковая панель рисуется раньше холста — дадим ей кадр на миниатюры.
+            ui.ctx().request_repaint();
+        }
+        self.view_pending = busy;
         self.draw_overlays(&painter, canvas, &visible_pages);
     }
 
     fn page_menu(&self, ui: &mut egui::Ui, page: usize, ops: &mut Vec<EditOp>) {
         ui.set_min_width(220.0);
-        ui.label(egui::RichText::new(format!("Страница {}", page + 1)).color(theme::MUTED).small());
+        ui.label(egui::RichText::new(format!("Страница {}", page + 1)).color(theme::muted()).small());
         if ui.button(format!("{}  Повернуть по часовой", ph::ARROW_CLOCKWISE)).clicked() {
             ops.push(EditOp::RotatePage { page, quarters: 1 });
             ui.close_menu();
@@ -1527,7 +1601,7 @@ impl ViewerApp {
         }
         ui.separator();
         if self.page_count() > 1 {
-            if ui.button(egui::RichText::new(format!("{}  Удалить страницу", ph::TRASH)).color(theme::DANGER)).clicked() {
+            if ui.button(egui::RichText::new(format!("{}  Удалить страницу", ph::TRASH)).color(theme::danger())).clicked() {
                 ops.push(EditOp::DeletePage(page));
                 ui.close_menu();
             }
@@ -1663,7 +1737,7 @@ impl ViewerApp {
                     if icon_button(ui, ph::CARET_RIGHT, "Следующая страница  (PageDown)", false).clicked() {
                         self.pending.push(Action::GotoPage(self.current_page + 1));
                     }
-                    ui.label(egui::RichText::new(format!("/ {n}")).color(theme::MUTED));
+                    ui.label(egui::RichText::new(format!("/ {n}")).color(theme::muted()));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.goto_text)
                             .desired_width(34.0)
@@ -1691,13 +1765,13 @@ impl ViewerApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            let muted = |s: String| egui::RichText::new(s).color(theme::MUTED).small();
+            let muted = |s: String| egui::RichText::new(s).color(theme::muted()).small();
             match &self.path {
                 Some(p) => {
                     let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                     ui.label(egui::RichText::new(name).small()).on_hover_text(p.display().to_string());
                     if self.dirty {
-                        ui.label(egui::RichText::new("изменён").color(theme::ACCENT).small());
+                        ui.label(egui::RichText::new("изменён").color(theme::accent()).small());
                     }
                 }
                 None => {
@@ -1740,7 +1814,7 @@ impl ViewerApp {
                 ui.add_space(6.0);
                 if let Some((msg, at, err)) = &self.status {
                     if at.elapsed().as_secs_f32() < 8.0 {
-                        let color = if *err { theme::DANGER } else { theme::OK };
+                        let color = if *err { theme::danger() } else { theme::ok() };
                         ui.label(egui::RichText::new(msg).color(color).small());
                         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
                     }
@@ -1755,7 +1829,7 @@ impl ViewerApp {
             ui.add_space(4.0);
             for (tab, label) in [(SideTab::Pages, "Страницы"), (SideTab::Search, "Поиск")] {
                 let active = self.side_tab == tab;
-                let text = egui::RichText::new(label).color(if active { theme::TEXT } else { theme::MUTED });
+                let text = egui::RichText::new(label).color(if active { theme::text() } else { theme::muted() });
                 let r = ui.add(egui::Button::new(text).frame(false));
                 if r.clicked() {
                     self.side_tab = tab;
@@ -1764,7 +1838,7 @@ impl ViewerApp {
                     let rr = r.rect;
                     ui.painter().line_segment(
                         [Pos2::new(rr.left(), rr.bottom() + 3.0), Pos2::new(rr.right(), rr.bottom() + 3.0)],
-                        Stroke::new(2.0, theme::ACCENT),
+                        Stroke::new(2.0, theme::accent()),
                     );
                 }
             }
@@ -1780,7 +1854,7 @@ impl ViewerApp {
     fn pages_panel(&mut self, ui: &mut egui::Ui) {
         if !self.opened {
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Нет открытого документа").color(theme::MUTED));
+            ui.label(egui::RichText::new("Нет открытого документа").color(theme::muted()));
             return;
         }
         let n = self.page_count();
@@ -1804,12 +1878,12 @@ impl ViewerApp {
                 if visible {
                     let p = ui.painter();
                     if is_cur {
-                        p.rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(0xf0, 0xb4, 0x3c, 22));
+                        p.rect_filled(rect, 6.0, theme::accent_wash());
                     } else if resp.hovered() {
-                        p.rect_filled(rect, 4.0, Color32::from_white_alpha(8));
+                        p.rect_filled(rect, 6.0, theme::hover_wash());
                     }
                     let img_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 6.0), Vec2::new(thumb_w, th));
-                    p.rect_filled(img_rect.translate(Vec2::new(0.0, 1.5)), 0.0, Color32::from_black_alpha(80));
+                    p.rect_filled(img_rect.translate(Vec2::new(0.0, 1.5)), 0.0, theme::shadow());
                     p.rect_filled(img_rect, 0.0, Color32::WHITE);
                     if let Some(tex) = self.thumbs.get(&(i, self.rotation)) {
                         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
@@ -1818,14 +1892,14 @@ impl ViewerApp {
                         want_thumbs.push(i);
                     }
                     if is_cur {
-                        p.rect_stroke(img_rect.expand(1.5), 0.0, Stroke::new(2.0, theme::ACCENT));
+                        p.rect_stroke(img_rect.expand(1.5), 0.0, Stroke::new(2.0, theme::accent()));
                     }
                     p.text(
                         Pos2::new(rect.center().x, img_rect.bottom() + 10.0),
                         egui::Align2::CENTER_CENTER,
                         format!("{}", i + 1),
                         egui::FontId::proportional(11.5),
-                        if is_cur { theme::TEXT } else { theme::MUTED },
+                        if is_cur { theme::text() } else { theme::muted() },
                     );
                 }
                 if resp.clicked() {
@@ -1843,6 +1917,9 @@ impl ViewerApp {
         }
         for op in ops {
             self.edit(op);
+        }
+        if self.view_pending {
+            want_thumbs.clear();
         }
         for i in want_thumbs {
             if self.thumb_inflight >= THUMB_INFLIGHT {
@@ -1878,7 +1955,7 @@ impl ViewerApp {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.label(egui::RichText::new("Поиск…").color(theme::MUTED).small());
+                ui.label(egui::RichText::new("Поиск…").color(theme::muted()).small());
             });
             return;
         }
@@ -1887,11 +1964,11 @@ impl ViewerApp {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(format!("«{}»: {}", self.search_query, self.hits.len()))
-                        .color(theme::MUTED)
+                        .color(theme::muted())
                         .small(),
                 );
                 if !self.hits.is_empty() {
-                    ui.label(egui::RichText::new("F3 — далее").color(theme::MUTED).small());
+                    ui.label(egui::RichText::new("F3 — далее").color(theme::muted()).small());
                 }
             });
         }
@@ -1904,17 +1981,17 @@ impl ViewerApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new(format!("Страница {}", h.page + 1)).color(theme::ACCENT).small());
+                        ui.label(egui::RichText::new(format!("Страница {}", h.page + 1)).color(theme::accent()).small());
                     });
                 }
                 let active = self.active_hit == Some(idx);
-                let text = egui::RichText::new(&h.snippet).size(12.0).color(if active { theme::TEXT } else { theme::MUTED });
+                let text = egui::RichText::new(&h.snippet).size(12.0).color(if active { theme::text() } else { theme::muted() });
                 let r = ui.add_sized(
                     Vec2::new(SIDEBAR_W - 16.0, 0.0),
                     egui::Button::new(text).frame(false).wrap(),
                 );
                 if active {
-                    ui.painter().rect_filled(r.rect, 3.0, Color32::from_rgba_unmultiplied(0xf0, 0xb4, 0x3c, 22));
+                    ui.painter().rect_filled(r.rect, 5.0, theme::accent_wash());
                 }
                 if r.clicked() {
                     reveal = Some(idx);
@@ -1979,11 +2056,11 @@ impl ViewerApp {
                         c.inputs.clear();
                     }
                 });
-                egui::Frame::none().fill(theme::BG).rounding(3.0).inner_margin(8.0).show(ui, |ui| {
+                egui::Frame::none().fill(theme::bg()).rounding(3.0).inner_margin(8.0).show(ui, |ui| {
                     ui.set_min_height(60.0);
                     ui.set_width(430.0);
                     if c.inputs.is_empty() {
-                        ui.label(egui::RichText::new("Файлы не выбраны (можно перетащить в окно)").color(theme::MUTED).small());
+                        ui.label(egui::RichText::new("Файлы не выбраны (можно перетащить в окно)").color(theme::muted()).small());
                     } else {
                         egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
                             let mut remove = None;
@@ -2049,10 +2126,10 @@ impl ViewerApp {
                     }
                     match &c.output {
                         Some(p) => {
-                            ui.label(egui::RichText::new(p.display().to_string()).small().color(theme::MUTED));
+                            ui.label(egui::RichText::new(p.display().to_string()).small().color(theme::muted()));
                         }
                         None => {
-                            ui.label(egui::RichText::new("не выбрано").small().color(theme::MUTED));
+                            ui.label(egui::RichText::new("не выбрано").small().color(theme::muted()));
                         }
                     }
                 });
@@ -2060,8 +2137,8 @@ impl ViewerApp {
                 ui.horizontal(|ui| {
                     let ready = !c.inputs.is_empty() && c.output.is_some() && self.progress.is_none();
                     let btn = egui::Button::new(egui::RichText::new(format!("{}  Запустить", ph::CHECK)).strong())
-                        .fill(if ready { theme::ACCENT_DIM } else { theme::PANEL })
-                        .stroke(Stroke::new(1.0, if ready { theme::ACCENT } else { theme::LINE }))
+                        .fill(if ready { theme::accent_dim() } else { theme::panel() })
+                        .stroke(Stroke::new(1.0, if ready { theme::accent() } else { theme::line() }))
                         .min_size(Vec2::new(130.0, 28.0));
                     if ui.add_enabled(ready, btn).clicked() {
                         let out = c.output.clone().unwrap();
@@ -2082,7 +2159,7 @@ impl ViewerApp {
                     }
                     if let Some((msg, frac)) = &self.progress {
                         ui.add(egui::ProgressBar::new(*frac).desired_width(160.0).desired_height(10.0));
-                        ui.label(egui::RichText::new(msg).small().color(theme::MUTED));
+                        ui.label(egui::RichText::new(msg).small().color(theme::muted()));
                     }
                 });
             });
@@ -2102,7 +2179,7 @@ impl ViewerApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(format!("Страница {}", page + 1)).color(theme::MUTED).small());
+                ui.label(egui::RichText::new(format!("Страница {}", page + 1)).color(theme::muted()).small());
                 let r = ui.add(egui::TextEdit::multiline(&mut text).desired_width(340.0).desired_rows(4).hint_text("Текст заметки"));
                 r.request_focus();
                 ui.add_space(6.0);
@@ -2154,8 +2231,8 @@ impl ViewerApp {
                         ("Перетащить файл", "открыть · Shift+PDF — добавить · картинки — вставить"),
                     ];
                     for (k, v) in rows {
-                        ui.label(egui::RichText::new(k).monospace().color(theme::ACCENT));
-                        ui.label(egui::RichText::new(v).color(theme::MUTED));
+                        ui.label(egui::RichText::new(k).monospace().color(theme::accent()));
+                        ui.label(egui::RichText::new(v).color(theme::muted()));
                         ui.end_row();
                     }
                 });
@@ -2179,7 +2256,7 @@ impl ViewerApp {
                     if ui.button("Сохранить").clicked() {
                         choice = Some(0);
                     }
-                    if ui.button(egui::RichText::new("Не сохранять").color(theme::DANGER)).clicked() {
+                    if ui.button(egui::RichText::new("Не сохранять").color(theme::danger())).clicked() {
                         choice = Some(1);
                     }
                     if ui.button("Отмена").clicked() {
@@ -2228,6 +2305,7 @@ impl eframe::App for ViewerApp {
 impl ViewerApp {
     /// Один кадр UI (вынесен из `eframe::App`, чтобы гонять без окна в тестах).
     pub fn frame(&mut self, ctx: &egui::Context) {
+        theme::sync(ctx);
         self.poll_events(ctx);
         self.upd.poll(&mut self.store);
         self.def_app.poll();
@@ -2240,7 +2318,7 @@ impl ViewerApp {
         }
 
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6.0, 5.0)))
+            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(6.0, 5.0)))
             .show(ctx, |ui| self.toolbar(ui));
 
         // Одна плашка за раз: обновление важнее предложения «по умолчанию».
@@ -2255,22 +2333,22 @@ impl ViewerApp {
         }
 
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6.0, 3.0)))
+            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(6.0, 3.0)))
             .show(ctx, |ui| self.status_bar(ui));
         if self.show_sidebar {
             egui::SidePanel::left("sidebar")
                 .exact_width(SIDEBAR_W)
                 .resizable(false)
-                .frame(egui::Frame::none().fill(theme::PANEL))
+                .frame(egui::Frame::none().fill(theme::panel()))
                 .show(ctx, |ui| self.sidebar(ui));
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme::CANVAS))
+            .frame(egui::Frame::none().fill(theme::canvas()))
             .show(ctx, |ui| {
                 if let Some(e) = &self.error {
                     ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new(format!("{}  {e}", ph::WARNING)).color(theme::DANGER));
+                        ui.label(egui::RichText::new(format!("{}  {e}", ph::WARNING)).color(theme::danger()));
                     });
                     return;
                 }
@@ -2279,7 +2357,7 @@ impl ViewerApp {
                         if self.path.is_none() && self.page_sizes.is_empty() && !self.loading_page {
                             ui.label(
                                 egui::RichText::new("Откройте PDF (Ctrl+O) или перетащите файл в окно")
-                                    .color(theme::MUTED)
+                                    .color(theme::muted())
                                     .size(15.0),
                             );
                         } else {

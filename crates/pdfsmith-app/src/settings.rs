@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::theme::ThemeChoice;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -13,11 +15,13 @@ pub struct Settings {
     pub ask_default_app: bool,
     /// Принтер, на котором печатали в прошлый раз.
     pub last_printer: Option<String>,
+    /// Оформление: как в системе, светлое или тёмное.
+    pub theme: ThemeChoice,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None }
+        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None, theme: ThemeChoice::System }
     }
 }
 
@@ -123,6 +127,7 @@ mod tests {
             skipped_version: Some("1.2.3".into()),
             ask_default_app: false,
             last_printer: Some("Microsoft Print to PDF".into()),
+            theme: ThemeChoice::Light,
         };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);

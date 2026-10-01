@@ -14,14 +14,16 @@ use std::sync::Arc;
 use std::thread;
 
 use eframe::egui;
-use pdfsmith_engine::disk_cache::{file_id, DiskCache, Tile};
+use pdfsmith_engine::disk_cache::{self, file_id, DiskCache, Tile};
 use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderOpts, RenderedImage, Rgba};
 
 use crate::print::{self, PrintError, PrintJob};
 use crate::print_ui::PREVIEW_PX;
 
-/// Сторона тайла в device-пикселях.
-pub const TILE: u32 = 256;
+/// Сторона тайла в device-пикселях. На тяжёлых чертежах PDFium платит за
+/// обход всех объектов страницы при каждом вызове, поэтому 512 вдвое
+/// дешевле 256 на ту же площадь (см. docs/perf-findings.md).
+pub const TILE: u32 = 512;
 /// Длинная сторона миниатюры (боковая панель) в пикселях.
 pub const THUMB_PX: f32 = 220.0;
 /// Сколько загруженных страниц держим одновременно.
@@ -29,7 +31,11 @@ const LOADED_PAGES: usize = 4;
 /// Сентинел LOD для миниатюр в дисковом кэше.
 const THUMB_LOD: i32 = i32::MIN + 1;
 /// Версия формата кэша: меняется при изменении рендера (например, аннотации).
-const CACHE_VERSION: &str = "v2";
+const CACHE_VERSION: &str = "v3";
+/// Тайл быстрее этого порога дешевле перерисовать, чем писать и читать с диска.
+const DISK_WORTH_MS: u128 = 8;
+/// Предел размера дискового кэша (чистится в фоне при запуске).
+const CACHE_MAX_BYTES: u64 = 1 << 30;
 
 /// Прямоугольник в «отображаемых» пунктах страницы: origin слева-сверху,
 /// координаты уже с учётом поворота просмотра.
@@ -139,11 +145,22 @@ pub fn spawn(ctx: egui::Context, dll_dir: Option<PathBuf>) -> RenderHandle {
         .name("pdfium".into())
         .spawn(move || worker(job_rx, event_tx, ctx, dll_dir))
         .expect("рендер-поток");
+    // Уборка дискового кэша — в фоне, запуск не ждёт.
+    let _ = thread::Builder::new().name("cache-prune".into()).spawn(|| {
+        let n = disk_cache::prune(&cache_root(), &format!("-{CACHE_VERSION}"), CACHE_MAX_BYTES, std::time::Duration::from_secs(3600));
+        if n > 0 {
+            log::info!("дисковый кэш: удалено каталогов {n}");
+        }
+    });
     RenderHandle { job_tx, event_rx }
 }
 
 /// Корень дискового кэша: `%LOCALAPPDATA%\pdfsmith\cache` либо temp.
 fn cache_root() -> PathBuf {
+    // Тесты не засоряют пользовательский кэш.
+    if cfg!(test) {
+        return std::env::temp_dir().join("pdfsmith-test-cache");
+    }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         PathBuf::from(local).join("pdfsmith").join("cache")
     } else {
@@ -206,6 +223,18 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
                 Err(_) => return, // UI закрылся
             },
         };
+        // Миниатюра — фоновая и непрерываемая: пропускаем вперёд всё, что уже
+        // лежит в канале (тайлы видимой области, правки).
+        let mut job = job;
+        while matches!(job, Job::Thumbnail { .. }) {
+            match job_rx.try_recv() {
+                Ok(next) => {
+                    pending.push_back(job);
+                    job = next;
+                }
+                Err(_) => break,
+            }
+        }
         // Схлопываем очередь тайлов: из нескольких запросов тайлов интересен
         // только самый свежий, а остальные задачи выполняются раньше него.
         let job = if matches!(job, Job::Tiles { .. }) {
@@ -301,6 +330,18 @@ impl Worker {
         Ok(&self.loaded[i].1)
     }
 
+    /// Доступ к странице для фоновых задач (миниатюры, поиск): берёт уже
+    /// загруженную, иначе грузит временно, не вытесняя из LRU страницы,
+    /// которые сейчас смотрит пользователь.
+    fn with_page<R>(&self, page: usize, f: impl FnOnce(&Page) -> R) -> Result<R, String> {
+        if let Some((_, pg)) = self.loaded.iter().find(|(p, _)| *p == page) {
+            return Ok(f(pg));
+        }
+        let doc = self.doc.as_ref().ok_or("документ не открыт")?;
+        let pg = doc.load_page(page).map_err(|e| e.to_string())?;
+        Ok(f(&pg))
+    }
+
     /// Дисковый кэш страницы, если он ещё соответствует её содержимому.
     fn disk_for(&self, page: usize) -> Option<&DiskCache> {
         if self.dirty_pages.contains(&page) {
@@ -353,7 +394,13 @@ impl Worker {
         let Some(size) = self.doc.as_ref().and_then(|d| d.page_size(page)) else { return };
         let longest = size.width_pt.max(size.height_pt).max(1.0);
         let scale = THUMB_PX / longest;
-        match self.render_full(page, rotation, scale) {
+        let (ew, eh) = if rotation & 1 == 1 { (size.height_pt, size.width_pt) } else { (size.width_pt, size.height_pt) };
+        let w = ((ew * scale).round() as i32).max(1);
+        let h = ((eh * scale).round() as i32).max(1);
+        let res = self
+            .with_page(page, |pg| pg.render_region(scale, 0, 0, w, h, rotation, true).map_err(|e| e.to_string()))
+            .and_then(|r| r);
+        match res {
             Ok(img) => {
                 if let Some(d) = self.disk_for(page) {
                     d.put(page, rotation, THUMB_LOD, 0, 0, &Tile { width: img.width, height: img.height, rgba: img.rgba.clone() });
@@ -446,13 +493,15 @@ impl Worker {
                 if tw <= 0 || th <= 0 {
                     continue;
                 }
+                let started = std::time::Instant::now();
                 let res = match self.page(page) {
                     Ok(pg) => pg.render_region(lod_scale, tx, ty, tw, th, rotation, true).map_err(|e| e.to_string()),
                     Err(e) => Err(e),
                 };
+                let worth_caching = started.elapsed().as_millis() >= DISK_WORTH_MS;
                 match res {
                     Ok(img) => {
-                        if let Some(d) = self.disk_for(page) {
+                        if let Some(d) = self.disk_for(page).filter(|_| worth_caching) {
                             d.put(page, rotation, lod, col, row, &Tile { width: img.width, height: img.height, rgba: img.rgba.clone() });
                         }
                         self.emit(Event::Tile { gen, page, rotation, lod, col, row, width: img.width, height: img.height, rgba: img.rgba });
@@ -474,20 +523,26 @@ impl Worker {
         for i in 0..n {
             let size = self.doc.as_ref().and_then(|d| d.page_size(i)).unwrap();
             self.progress(format!("Поиск: страница {}/{n}", i + 1), i as f32 / n.max(1) as f32);
-            let Ok(pg) = self.page(i) else { continue };
-            for h in pg.search(&query) {
-                let rects = h
-                    .rects
-                    .iter()
-                    .map(|r| {
-                        let (x0, y0) = pg.pdf_to_display(r.left, r.top);
-                        let (x1, y1) = pg.pdf_to_display(r.right, r.bottom);
-                        DispRect { x0: x0.min(x1), y0: y0.min(y1), x1: x0.max(x1), y1: y0.max(y1) }
+            let _ = size;
+            let page_hits = self.with_page(i, |pg| {
+                pg.search(&query)
+                    .into_iter()
+                    .map(|h| {
+                        let rects = h
+                            .rects
+                            .iter()
+                            .map(|r| {
+                                let (x0, y0) = pg.pdf_to_display(r.left, r.top);
+                                let (x1, y1) = pg.pdf_to_display(r.right, r.bottom);
+                                DispRect { x0: x0.min(x1), y0: y0.min(y1), x1: x0.max(x1), y1: y0.max(y1) }
+                            })
+                            .collect();
+                        SearchHit { page: i, rects, snippet: h.snippet }
                     })
-                    .collect();
-                let _ = size;
-                hits.push(SearchHit { page: i, rects, snippet: h.snippet });
-            }
+                    .collect::<Vec<_>>()
+            });
+            let Ok(page_hits) = page_hits else { continue };
+            hits.extend(page_hits);
             if hits.len() > 5000 {
                 break;
             }

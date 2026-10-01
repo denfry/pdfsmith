@@ -4,7 +4,7 @@ use eframe::egui::{self, RichText};
 
 use crate::default_app::DefaultApp;
 use crate::settings::SettingsStore;
-use crate::theme;
+use crate::theme::{self, ThemeChoice};
 use crate::updates::{UpdState, UpdateUi, CURRENT_VERSION};
 
 pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut SettingsStore, upd: &mut UpdateUi, def: &mut DefaultApp) {
@@ -18,6 +18,17 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut Setting
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
+            ui.label(RichText::new("Оформление").strong());
+            ui.horizontal(|ui| {
+                for choice in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                    if ui.selectable_label(store.data.theme == choice, choice.label()).clicked() && store.data.theme != choice {
+                        store.data.theme = choice;
+                        store.save();
+                        theme::set_choice(ctx, choice);
+                    }
+                }
+            });
+            ui.separator();
             ui.label(RichText::new("Обновления").strong());
             let mut auto = store.data.auto_update;
             if ui
@@ -27,7 +38,7 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut Setting
             {
                 upd.set_auto_update(store, auto);
             }
-            ui.label(RichText::new(format!("Текущая версия: {CURRENT_VERSION}")).color(theme::MUTED));
+            ui.label(RichText::new(format!("Текущая версия: {CURRENT_VERSION}")).color(theme::muted()));
             if upd.enabled() {
                 ui.horizontal(|ui| {
                     let downloading = matches!(upd.state, UpdState::Downloading { .. });
@@ -39,10 +50,10 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, store: &mut Setting
                     }
                 });
             } else {
-                ui.label(RichText::new("Обновления работают в установленной версии программы").color(theme::MUTED));
+                ui.label(RichText::new("Обновления работают в установленной версии программы").color(theme::muted()));
             }
             if let Some((msg, err)) = &upd.message {
-                ui.label(RichText::new(msg).color(if *err { theme::DANGER } else { theme::OK }));
+                ui.label(RichText::new(msg).color(if *err { theme::danger() } else { theme::ok() }));
             }
             ui.separator();
             ui.label(RichText::new("Приложение по умолчанию").strong());

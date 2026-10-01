@@ -29,6 +29,8 @@ impl DiskCache {
     pub fn new(root: &Path, file_id: &str) -> Self {
         let dir = root.join(file_id);
         let enabled = std::fs::create_dir_all(&dir).is_ok();
+        // Отметка использования: обновляет время каталога для [`prune`].
+        let _ = std::fs::write(dir.join(".used"), []);
         DiskCache { dir, enabled }
     }
 
@@ -71,6 +73,52 @@ impl DiskCache {
     }
 }
 
+/// Чистит корень кэша: удаляет каталоги чужой версии (без суффикса
+/// `keep_suffix`), затем самые давно использованные, пока общий размер больше
+/// `max_bytes`. Каталоги, тронутые за последние `recent`, не трогает — их может
+/// прямо сейчас читать открытый документ. Возвращает число удалённых каталогов.
+pub fn prune(root: &Path, keep_suffix: &str, max_bytes: u64, recent: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    let mut live: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let used = meta.modified().unwrap_or(now);
+        let is_recent = now.duration_since(used).map(|d| d < recent).unwrap_or(true);
+        let current = path.file_name().map(|n| n.to_string_lossy().ends_with(keep_suffix)).unwrap_or(false);
+        if !current && !is_recent {
+            if std::fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+        live.push((if is_recent { now } else { used }, dir_size(&path), path));
+    }
+    let mut total: u64 = live.iter().map(|(_, s, _)| s).sum();
+    live.sort_by_key(|(t, _, _)| *t);
+    for (t, size, path) in live {
+        if total <= max_bytes || t == now {
+            break;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            total -= size;
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|it| it.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0)
+}
+
 /// Стабильный идентификатор файла по пути, размеру и времени изменения.
 /// Меняется, если файл изменили, — кэш не вернёт устаревшие тайлы.
 pub fn file_id(path: &Path) -> String {
@@ -104,6 +152,26 @@ mod tests {
         let tile = Tile { width: 2, height: 1, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] };
         cache.put(0, 0, 1, 3, 4, &tile);
         assert_eq!(cache.get(0, 0, 1, 3, 4), Some(tile));
+    }
+
+    #[test]
+    fn prune_drops_old_versions_then_oldest_until_under_limit() {
+        let root = std::env::temp_dir().join("pdfsmith-test-prune");
+        let _ = std::fs::remove_dir_all(&root);
+        let old_ver = DiskCache::new(&root, "aaa-v1");
+        old_ver.put(0, 0, 0, 0, 0, &Tile { width: 1, height: 1, rgba: vec![0; 4] });
+        let a = DiskCache::new(&root, "bbb-v3");
+        a.put(0, 0, 0, 0, 0, &Tile { width: 16, height: 16, rgba: vec![0; 1024] });
+        let b = DiskCache::new(&root, "ccc-v3");
+        b.put(0, 0, 0, 0, 0, &Tile { width: 16, height: 16, rgba: vec![0; 1024] });
+        // Всё «свежее» — ничего не трогаем.
+        assert_eq!(prune(&root, "-v3", 0, std::time::Duration::from_secs(3600)), 0);
+        // Без защиты свежих: чужая версия уходит, затем старейшие до лимита.
+        let removed = prune(&root, "-v3", 1500, std::time::Duration::ZERO);
+        assert!(!root.join("aaa-v1").exists());
+        assert_eq!(removed, 2, "старая версия + один из двух текущих");
+        assert_eq!(["bbb-v3", "ccc-v3"].iter().filter(|d| root.join(d).exists()).count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

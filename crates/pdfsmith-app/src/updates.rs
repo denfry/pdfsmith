@@ -248,7 +248,7 @@ impl UpdateUi {
     pub fn banner(&mut self, ui: &mut egui::Ui, store: &mut SettingsStore) {
         let state = self.state.clone();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(ph::ARROW_CIRCLE_UP).size(theme::ICON).color(theme::ACCENT));
+            ui.label(RichText::new(ph::ARROW_CIRCLE_UP).size(theme::ICON).color(theme::accent()));
             match &state {
                 UpdState::Idle => {}
                 UpdState::Available(m) => {
@@ -290,7 +290,7 @@ impl UpdateUi {
                 }
             }
             if let Some((msg, true)) = &self.message {
-                ui.label(RichText::new(msg).color(theme::DANGER));
+                ui.label(RichText::new(msg).color(theme::danger()));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, ph::X, "Скрыть до следующего запуска", false).clicked() {
@@ -300,7 +300,7 @@ impl UpdateUi {
         });
         if self.show_notes {
             if let UpdState::Available(m) = &state {
-                ui.label(RichText::new(&m.notes).color(theme::MUTED));
+                ui.label(RichText::new(&m.notes).color(theme::muted()));
             }
         }
     }
