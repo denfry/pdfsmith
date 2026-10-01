@@ -15,7 +15,7 @@ pdfsmith-pdfium.workspace = true
 pdfsmith-update.workspace = true
 log.workspace = true
 eframe = { version = "0.30.0", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
-pollster = "0.4"
+pollster = "1.0"
 # eframe подключает wgpu без DX12 — включаем явно (единственный путь к WARP на ПК без видеодрайвера).
 wgpu = { version = "23.0.1", default-features = false, features = ["dx12", "wgsl"] }
 env_logger = "0.11.10"
