@@ -5,6 +5,7 @@
 [![CI](https://github.com/denfry/pdfsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/denfry/pdfsmith/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/denfry/pdfsmith)](https://github.com/denfry/pdfsmith/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/mVZcNUAGZt)
 
 Тайловый рендер в фоновом потоке, дисковый кэш, непрерывная лента страниц.
 
