@@ -16,6 +16,7 @@ mod print_ui;
 mod render_thread;
 mod settings;
 mod settings_ui;
+mod sign_ui;
 mod theme;
 mod updates;
 

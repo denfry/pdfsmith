@@ -17,11 +17,13 @@ pub struct Settings {
     pub last_printer: Option<String>,
     /// Оформление: как в системе, светлое или тёмное.
     pub theme: ThemeChoice,
+    /// Отпечаток (hex) сертификата, которым подписывали в прошлый раз.
+    pub last_cert: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None, theme: ThemeChoice::System }
+        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None, theme: ThemeChoice::System, last_cert: None }
     }
 }
 
@@ -128,6 +130,7 @@ mod tests {
             ask_default_app: false,
             last_printer: Some("Microsoft Print to PDF".into()),
             theme: ThemeChoice::Light,
+            last_cert: Some("0A1B".into()),
         };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);

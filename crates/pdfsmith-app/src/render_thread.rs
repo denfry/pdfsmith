@@ -16,6 +16,7 @@ use std::thread;
 use eframe::egui;
 use pdfsmith_engine::disk_cache::{self, file_id, DiskCache, Tile};
 use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderOpts, RenderedImage, Rgba};
+use pdfsmith_sign::{sign_pdf, store, CertInfo, SignError, SignField, SignInfo};
 
 use crate::print::{self, PrintError, PrintJob};
 use crate::print_ui::PREVIEW_PX;
@@ -31,7 +32,7 @@ const LOADED_PAGES: usize = 4;
 /// Сентинел LOD для миниатюр в дисковом кэше.
 const THUMB_LOD: i32 = i32::MIN + 1;
 /// Версия формата кэша: меняется при изменении рендера (например, аннотации).
-const CACHE_VERSION: &str = "v3";
+const CACHE_VERSION: &str = "v4";
 /// Тайл быстрее этого порога дешевле перерисовать, чем писать и читать с диска.
 const DISK_WORTH_MS: u128 = 8;
 /// Предел размера дискового кэша (чистится в фоне при запуске).
@@ -84,6 +85,18 @@ pub enum ConvertOp {
     Split { src: PathBuf, out_dir: PathBuf },
 }
 
+/// Подпись ЭП: видимый штамп в `rect` на странице `page`, результат — в `out`.
+pub struct SignJob {
+    pub page: usize,
+    /// Поворот просмотра, в котором нарисован `rect`.
+    pub rotation: u8,
+    pub rect: DispRect,
+    pub cert: CertInfo,
+    pub reason: String,
+    pub location: String,
+    pub out: PathBuf,
+}
+
 /// Команда из UI в рендер-поток.
 pub enum Job {
     Open(PathBuf),
@@ -102,6 +115,7 @@ pub enum Job {
     PrintPreview { page: usize, annotations: bool },
     /// Печать; `cancel` взводит UI.
     Print { job: PrintJob, cancel: Arc<AtomicBool> },
+    Sign(Box<SignJob>),
 }
 
 /// Одно вхождение поиска: страница, прямоугольники (display pt при повороте 0).
@@ -283,6 +297,11 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
             }
             Job::PrintPreview { page, annotations } => w.print_preview(page, annotations),
             Job::Print { job, cancel } => w.print(job, &cancel),
+            Job::Sign(job) => {
+                if let Err(e) = w.sign(*job) {
+                    w.emit(Event::Error(e));
+                }
+            }
         }
     }
 }
@@ -722,6 +741,54 @@ impl Worker {
             }
             Err(e) => self.emit(Event::Error(e.to_string())),
         }
+    }
+
+    fn sign(&mut self, job: SignJob) -> Result<(), String> {
+        let r = self.disp_rect_to_pdf(job.page, job.rotation, job.rect)?;
+        let page_rotation = self.page(job.page)?.rotation();
+        let doc = self.doc.as_ref().ok_or("документ не открыт")?;
+        // Без правок подписываем файл как есть — прежние подписи остаются
+        // валидными; с правками — свежую копию из PDFium.
+        let base = match (&self.path, self.dirty) {
+            (Some(p), false) => std::fs::read(p).map_err(|e| e.to_string())?,
+            _ => doc.to_bytes().map_err(|e| e.to_string())?,
+        };
+        let font = load_font()?;
+        let now = store::now();
+        let c = &job.cert;
+        let mut lines = vec!["Подписано электронной подписью".to_string(), c.owner.clone()];
+        if !c.organization.is_empty() && c.organization != c.owner {
+            lines.push(c.organization.clone());
+        }
+        lines.push(format!("Сертификат: {}", c.serial));
+        lines.push(format!("Действителен с {} по {}", c.valid_from, c.valid_to));
+        lines.push(format!("Дата: {}", now.local.display()));
+        if !job.reason.trim().is_empty() {
+            lines.push(format!("Причина: {}", job.reason.trim()));
+        }
+        let field = SignField { page: job.page, rect: [r.left, r.bottom, r.right, r.top], page_rotation, lines };
+        let info = SignInfo { name: c.owner.clone(), reason: job.reason.clone(), location: job.location.clone(), time: now.local };
+        self.progress("Подпись… введите PIN-код токена, если его спросят", 0.5);
+        let attempt = |base: Vec<u8>| {
+            sign_pdf(base, &field, &info, &font, |chunks| store::sign_detached(&c.thumbprint, chunks, now.utc_filetime))
+        };
+        let signed = match attempt(base) {
+            // Файл, который не разобрал lopdf, нормализуем через PDFium.
+            Err(SignError::Parse(e)) => {
+                log::warn!("подпись: исходный файл не разобран ({e}), пересохраняю через PDFium");
+                attempt(doc.to_bytes().map_err(|e| e.to_string())?)
+            }
+            r => r,
+        }
+        .map_err(|e| e.to_string())?;
+
+        let tmp = job.out.with_extension("pdf.tmp");
+        std::fs::write(&tmp, &signed).map_err(|e| format!("запись: {e}"))?;
+        std::fs::rename(&tmp, &job.out).map_err(|e| format!("переименование: {e}"))?;
+        log::info!("подписано: {} ({} байт)", job.out.display(), signed.len());
+        self.open(job.out.clone());
+        self.emit(Event::Done(format!("Подписано: {}", job.out.display())));
+        Ok(())
     }
 
     fn convert(&mut self, op: ConvertOp) -> Result<(), String> {

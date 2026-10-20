@@ -112,6 +112,10 @@ fn bind(dll_dir: Option<&Path>) -> Result<Box<dyn PdfiumLibraryBindings>, PdfErr
 /// самих страниц) и байты файла (PDFium ссылается на них, пока документ открыт).
 pub struct Document {
     pub(crate) handle: FPDF_DOCUMENT,
+    /// Окружение форм: без него PDFium не рисует поля (в т.ч. подписи).
+    pub(crate) form: FPDF_FORMHANDLE,
+    /// Структура колбэков должна жить, пока жив `form`.
+    pub(crate) _form_info: Box<FPDF_FORMFILLINFO>,
     pub(crate) _bytes: Vec<u8>,
     pub(crate) page_sizes: Vec<PageSize>,
 }
@@ -146,7 +150,17 @@ impl Document {
             }
         }
 
-        Ok(Document { handle, _bytes: bytes, page_sizes })
+        Ok(Document::wrap(handle, bytes, page_sizes))
+    }
+
+    /// Оборачивает хэндл и поднимает окружение форм (колбэки не нужны:
+    /// документ только рисуется, интерактивного заполнения нет).
+    pub(crate) fn wrap(handle: FPDF_DOCUMENT, bytes: Vec<u8>, page_sizes: Vec<PageSize>) -> Document {
+        // SAFETY: FPDF_FORMFILLINFO — C-структура из версии и необязательных колбэков.
+        let mut info: Box<FPDF_FORMFILLINFO> = Box::new(unsafe { std::mem::zeroed() });
+        info.version = 1;
+        let form = unsafe { bindings().FPDFDOC_InitFormFillEnvironment(handle, &mut *info) };
+        Document { handle, form, _form_info: info, _bytes: bytes, page_sizes }
     }
 
     pub fn page_count(&self) -> usize {
@@ -168,7 +182,10 @@ impl Document {
         }
         let width_pt = unsafe { b.FPDF_GetPageWidthF(handle) };
         let height_pt = unsafe { b.FPDF_GetPageHeightF(handle) };
-        Ok(Page { handle, width_pt, height_pt })
+        if !self.form.is_null() {
+            unsafe { b.FORM_OnAfterLoadPage(handle, self.form) };
+        }
+        Ok(Page { handle, form: self.form, width_pt, height_pt })
     }
 
     /// Удобный путь: рендер всей страницы целиком в указанном масштабе.
@@ -182,7 +199,11 @@ impl Document {
 
 impl Drop for Document {
     fn drop(&mut self) {
-        unsafe { bindings().FPDF_CloseDocument(self.handle) };
+        let b = bindings();
+        unsafe {
+            b.FPDFDOC_ExitFormFillEnvironment(self.form);
+            b.FPDF_CloseDocument(self.handle);
+        }
     }
 }
 
@@ -190,6 +211,7 @@ impl Drop for Document {
 /// тайлов.
 pub struct Page {
     pub(crate) handle: FPDF_PAGE,
+    pub(crate) form: FPDF_FORMHANDLE,
     pub(crate) width_pt: f32,
     pub(crate) height_pt: f32,
 }
@@ -277,6 +299,11 @@ impl Page {
             | if opts.antialias { 0 } else { render_flags_no_aa() };
         unsafe {
             b.FPDF_RenderPageBitmapWithMatrix(bitmap, self.handle, &matrix, &clip, flags);
+            // Поля форм и подписи рисует только модуль форм, поверх страницы.
+            if opts.annotations && !self.form.is_null() {
+                let (fw, fh) = if rotation & 1 == 1 { (sh, sw) } else { (sw, sh) };
+                b.FPDF_FFLDraw(self.form, bitmap, self.handle, -tx, -ty, fw.round() as c_int, fh.round() as c_int, (rotation & 3) as c_int, flags);
+            }
         }
 
         let stride = unsafe { b.FPDFBitmap_GetStride(bitmap) } as usize;
@@ -296,7 +323,13 @@ impl Page {
 
 impl Drop for Page {
     fn drop(&mut self) {
-        unsafe { bindings().FPDF_ClosePage(self.handle) };
+        let b = bindings();
+        unsafe {
+            if !self.form.is_null() {
+                b.FORM_OnBeforeClosePage(self.handle, self.form);
+            }
+            b.FPDF_ClosePage(self.handle);
+        }
     }
 }
 

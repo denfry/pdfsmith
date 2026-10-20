@@ -5,6 +5,7 @@ members = [
     "crates/pdfsmith-engine",
     "crates/pdfsmith-app",
     "crates/pdfsmith-update",
+    "crates/pdfsmith-sign",
 ]
 
 [workspace.package]
@@ -12,12 +13,13 @@ edition = "2021"
 version = "0.1.4"
 license = "Proprietary"
 authors = ["PDFsmith"]
-rust-version = "1.80"
+rust-version = "1.88"
 
 [workspace.dependencies]
 pdfsmith-pdfium = { path = "crates/pdfsmith-pdfium" }
 pdfsmith-engine = { path = "crates/pdfsmith-engine" }
 pdfsmith-update = { path = "crates/pdfsmith-update" }
+pdfsmith-sign = { path = "crates/pdfsmith-sign" }
 thiserror = "2"
 log = "0.4"
 

@@ -80,7 +80,7 @@ impl Document {
         if handle.is_null() {
             return Err(PdfError::Open("FPDF_CreateNewDocument вернул NULL".into()));
         }
-        Ok(Document { handle, _bytes: Vec::new(), page_sizes: Vec::new() })
+        Ok(Document::wrap(handle, Vec::new(), Vec::new()))
     }
 
     /// Перечитывает размеры страниц после структурных изменений.
@@ -179,6 +179,17 @@ impl Document {
 
     /// Сохраняет копию документа (полная перезапись, не инкрементально).
     pub fn save_to(&self, path: &Path) -> Result<(), PdfError> {
+        let bytes = self.to_bytes()?;
+        // Пишем во временный файл рядом и переименовываем — исходник не
+        // повреждается при сбое посреди записи.
+        let tmp = path.with_extension("pdf.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| PdfError::Render(format!("запись: {e}")))?;
+        std::fs::rename(&tmp, path).map_err(|e| PdfError::Render(format!("переименование: {e}")))?;
+        Ok(())
+    }
+
+    /// Документ целиком в байтах PDF (полная перезапись).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PdfError> {
         let mut bytes = Vec::new();
         {
             let mut fw = FileWrite {
@@ -199,12 +210,7 @@ impl Document {
                 return Err(PdfError::Render("FPDF_SaveAsCopy отказал".into()));
             }
         }
-        // Пишем во временный файл рядом и переименовываем — исходник не
-        // повреждается при сбое посреди записи.
-        let tmp = path.with_extension("pdf.tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| PdfError::Render(format!("запись: {e}")))?;
-        std::fs::rename(&tmp, path).map_err(|e| PdfError::Render(format!("переименование: {e}")))?;
-        Ok(())
+        Ok(bytes)
     }
 
     /// Добавляет страницу с картинкой (RGBA), масштаб `dpi` пикселей на дюйм.
@@ -345,6 +351,11 @@ impl Document {
 }
 
 impl Page {
+    /// /Rotate страницы: четверти оборота по часовой (0..3).
+    pub fn rotation(&self) -> u8 {
+        (unsafe { bindings().FPDFPage_GetRotation(self.handle) }).rem_euclid(4) as u8
+    }
+
     /// Переводит координаты «отображаемой» страницы (origin слева-сверху,
     /// пункты, как в раскладке просмотрщика при повороте 0) в PDF-пространство.
     pub fn display_to_pdf(&self, x: f32, y: f32) -> (f32, f32) {

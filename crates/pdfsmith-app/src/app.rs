@@ -19,9 +19,10 @@ use crate::print::PrintError;
 use crate::print_ui::{DocInfo, PrintDialog, PrintRequest};
 use crate::render_thread::{
     rotate_pt, spawn, ConvertOp, DispRect, EditOp, Event, ImageFormat, Job, PageTiles, RenderHandle,
-    SearchHit, TILE,
+    SearchHit, SignJob, TILE,
 };
 use crate::settings::SettingsStore;
+use crate::sign_ui::{hex, SignChoice, SignDialog};
 use crate::theme::{self, icon_button, vsep};
 use crate::updates::{UpdState, UpdateUi};
 
@@ -52,6 +53,8 @@ enum Tool {
     Highlight,
     Rect,
     Note,
+    /// Подпись ЭП: обвести место штампа.
+    Sign,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -484,6 +487,7 @@ pub struct ViewerApp {
     close_dialog: bool,
     show_help: bool,
     print: PrintDialog,
+    sign: SignDialog,
     /// Флаг отмены идущей печати.
     print_cancel: Option<Arc<AtomicBool>>,
     // Статус.
@@ -566,6 +570,7 @@ impl ViewerApp {
             close_dialog: false,
             show_help: false,
             print: PrintDialog::default(),
+            sign: SignDialog::default(),
             print_cancel: None,
             status: None,
             progress: None,
@@ -954,8 +959,8 @@ impl ViewerApp {
     // Ввод
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        // Окно печати обрабатывает Enter/Esc само; просмотр позади не трогаем.
-        if self.print.open {
+        // Окна печати и подписи обрабатывают Enter/Esc сами; просмотр позади не трогаем.
+        if self.print.open || self.sign.is_open() {
             return;
         }
         // Хоткеи не должны срабатывать, пока фокус в текстовом поле.
@@ -1071,6 +1076,9 @@ impl ViewerApp {
             if k(egui::Key::N) {
                 self.tool = Tool::Note;
             }
+            if k(egui::Key::G) {
+                self.tool = Tool::Sign;
+            }
             if k(egui::Key::F3) && !self.hits.is_empty() {
                 let n = self.hits.len();
                 let cur = self.active_hit.unwrap_or(0);
@@ -1162,6 +1170,32 @@ impl ViewerApp {
         }
     }
 
+    fn sign_window(&mut self, ctx: &egui::Context) {
+        if let Some(choice) = self.sign.ui(ctx) {
+            self.start_sign(choice);
+        }
+    }
+
+    /// Спрашивает, куда сохранить подписанную копию, и отдаёт задание.
+    fn start_sign(&mut self, c: SignChoice) {
+        let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]);
+        let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "документ".into());
+        d = d.set_file_name(format!("{stem}_подписан.pdf"));
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            d = d.set_directory(dir);
+        }
+        let Some(out) = d.save_file() else { return };
+        let thumb = hex(&c.cert.thumbprint);
+        if self.store.data.last_cert.as_deref() != Some(thumb.as_str()) {
+            self.store.data.last_cert = Some(thumb);
+            self.store.save();
+        }
+        self.tool = Tool::Hand;
+        self.progress = Some(("Подпись…".into(), 0.1));
+        let job = SignJob { page: c.page, rotation: c.rotation, rect: c.rect, cert: c.cert, reason: c.reason, location: c.location, out };
+        let _ = self.handle.job_tx.send(Job::Sign(Box::new(job)));
+    }
+
     fn export_png(&mut self) {
         let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or("page".into());
         if let Some(path) = rfd::FileDialog::new()
@@ -1206,7 +1240,7 @@ impl ViewerApp {
                 (true, _) => Some(Drag::Pan),
                 (false, Some((page, x, y))) => match self.tool {
                     Tool::Pen => Some(Drag::Ink { page, points: vec![(x, y)] }),
-                    Tool::Select | Tool::Highlight | Tool::Rect => Some(Drag::Rect { page, start: (x, y), cur: (x, y) }),
+                    Tool::Select | Tool::Highlight | Tool::Rect | Tool::Sign => Some(Drag::Rect { page, start: (x, y), cur: (x, y) }),
                     _ => None,
                 },
                 (false, None) => Some(Drag::Pan),
@@ -1287,6 +1321,13 @@ impl ViewerApp {
                     Tool::Rect => {
                         self.ghost(page, Mark::Frame(start, cur));
                         self.edit(EditOp::Rect { page, rect, color: rgba, width: self.pen_width });
+                    }
+                    Tool::Sign => {
+                        if (rect.x1 - rect.x0) < 20.0 || (rect.y1 - rect.y0) < 10.0 {
+                            self.set_status("Обведите место для подписи побольше", true);
+                            return;
+                        }
+                        self.sign.show_for(page, self.rotation, rect, self.store.data.last_cert.as_deref());
                     }
                     _ => {}
                 }
@@ -1410,6 +1451,7 @@ impl ViewerApp {
                     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_rgb(80, 150, 255)));
                 }
                 Tool::Highlight => self.draw_mark(painter, *page, &Mark::Marker(*start, *cur), self.pen_color, self.pen_width),
+                Tool::Sign => self.draw_sign_frame(painter, *page, *start, *cur),
                 _ => self.draw_mark(painter, *page, &Mark::Frame(*start, *cur), self.pen_color, self.pen_width),
             },
             Some(Drag::Ink { page, points }) => {
@@ -1419,6 +1461,18 @@ impl ViewerApp {
             }
             _ => {}
         }
+        // Место будущего штампа, пока открыто окно подписи.
+        if let Some((page, rotation, r)) = self.sign.target() {
+            if rotation == self.rotation && visible.contains(&page) {
+                self.draw_sign_frame(painter, page, (r.x0, r.y0), (r.x1, r.y1));
+            }
+        }
+    }
+
+    fn draw_sign_frame(&self, painter: &egui::Painter, page: usize, a: (f32, f32), b: (f32, f32)) {
+        let rect = self.disp_rect_on_screen(page, a, b);
+        painter.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(31, 58, 147, 30));
+        painter.rect_stroke(rect, 2.0, Stroke::new(1.5, Color32::from_rgb(31, 58, 147)));
     }
 
     fn disp_rect_on_screen(&self, page: usize, a: (f32, f32), b: (f32, f32)) -> Rect {
@@ -1686,6 +1740,7 @@ impl ViewerApp {
                     (Tool::Highlight, ph::HIGHLIGHTER, "Маркер  (M)"),
                     (Tool::Rect, ph::RECTANGLE, "Рамка  (R)"),
                     (Tool::Note, ph::CHAT_TEXT, "Заметка  (N)"),
+                    (Tool::Sign, ph::SEAL_CHECK, "Подписать ЭП (КриптоПро): обведите место подписи  (G)"),
                 ];
                 for (t, icon, tip) in tools {
                     if icon_button(ui, icon, tip, self.tool == t).clicked() {
@@ -2221,7 +2276,7 @@ impl ViewerApp {
                         ("PgUp / PgDn, ← →", "страница назад / вперёд"),
                         ("Home / End", "первая / последняя"),
                         ("Пробел", "экран вниз (Shift — вверх)"),
-                        ("H T P M R N", "рука · текст · карандаш · маркер · рамка · заметка"),
+                        ("H T P M R N G", "рука · текст · карандаш · маркер · рамка · заметка · подпись ЭП"),
                         ("Ctrl+Z", "отменить аннотацию"),
                         ("Ctrl+F, F3", "поиск, следующее совпадение"),
                         ("Ctrl+O / S / Shift+S", "открыть / сохранить / сохранить как"),
@@ -2371,6 +2426,7 @@ impl ViewerApp {
 
         self.convert_window(ctx);
         self.print_window(ctx);
+        self.sign_window(ctx);
         self.note_window(ctx);
         self.help_window(ctx);
         self.close_window(ctx);

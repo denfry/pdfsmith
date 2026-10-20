@@ -13,6 +13,7 @@ path = "src/main.rs"
 pdfsmith-engine.workspace = true
 pdfsmith-pdfium.workspace = true
 pdfsmith-update.workspace = true
+pdfsmith-sign.workspace = true
 log.workspace = true
 eframe = { version = "0.30.0", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 pollster = "0.4"
