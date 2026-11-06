@@ -37,6 +37,17 @@ pub struct PdfRect {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba(pub u8, pub u8, pub u8, pub u8);
 
+/// Символ на странице: рамка глифа в пунктах PDF-пространства и кегль.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextChar {
+    pub ch: char,
+    pub left: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub top: f32,
+    pub size: f32,
+}
+
 /// Одно вхождение при поиске: индекс первого символа, прямоугольники, контекст.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -416,6 +427,35 @@ impl Page {
             b.FPDFText_ClosePage(tp);
             utf16_to_string(&buf)
         }
+    }
+
+    /// Видимые символы страницы с рамками (PDF-пространство) — для разбора
+    /// таблиц по геометрии. Пробелы и вставленные PDFium переводы строк пропускаются.
+    pub fn chars(&self) -> Vec<TextChar> {
+        let b = bindings();
+        let mut out = Vec::new();
+        unsafe {
+            let tp = b.FPDFText_LoadPage(self.handle);
+            if tp.is_null() {
+                return out;
+            }
+            let n = b.FPDFText_CountChars(tp).max(0);
+            out.reserve(n as usize);
+            for i in 0..n {
+                let Some(ch) = char::from_u32(b.FPDFText_GetUnicode(tp, i)) else { continue };
+                if ch.is_whitespace() || ch.is_control() {
+                    continue;
+                }
+                let (mut l, mut r, mut bt, mut t) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                if !b.is_true(b.FPDFText_GetCharBox(tp, i, &mut l, &mut r, &mut bt, &mut t)) || r <= l || t <= bt {
+                    continue;
+                }
+                let size = b.FPDFText_GetFontSize(tp, i) as f32;
+                out.push(TextChar { ch, left: l as f32, right: r as f32, bottom: bt as f32, top: t as f32, size });
+            }
+            b.FPDFText_ClosePage(tp);
+        }
+        out
     }
 
     /// Текст внутри прямоугольника (PDF-пространство).

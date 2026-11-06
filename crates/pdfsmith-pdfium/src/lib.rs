@@ -17,7 +17,9 @@ use std::sync::{Mutex, OnceLock};
 use pdfium_render::prelude::*;
 
 pub mod edit;
-pub use edit::{PdfRect, Rgba, SearchHit};
+pub mod text_edit;
+pub use edit::{PdfRect, Rgba, SearchHit, TextChar};
+pub use text_edit::{TextChange, TextObject};
 
 /// Формат битмапа BGRA, 8 бит на канал (значение PDFium `FPDFBitmap_BGRA`).
 pub(crate) const FORMAT_BGRA: c_int = 4;
@@ -118,6 +120,8 @@ pub struct Document {
     pub(crate) _form_info: Box<FPDF_FORMFILLINFO>,
     pub(crate) _bytes: Vec<u8>,
     pub(crate) page_sizes: Vec<PageSize>,
+    /// Системные шрифты, загруженные для правки текста (закрываются в Drop).
+    pub(crate) fonts: std::cell::RefCell<Vec<(&'static str, FPDF_FONT)>>,
 }
 
 impl Document {
@@ -160,7 +164,7 @@ impl Document {
         let mut info: Box<FPDF_FORMFILLINFO> = Box::new(unsafe { std::mem::zeroed() });
         info.version = 1;
         let form = unsafe { bindings().FPDFDOC_InitFormFillEnvironment(handle, &mut *info) };
-        Document { handle, form, _form_info: info, _bytes: bytes, page_sizes }
+        Document { handle, form, _form_info: info, _bytes: bytes, page_sizes, fonts: Default::default() }
     }
 
     pub fn page_count(&self) -> usize {
@@ -201,6 +205,9 @@ impl Drop for Document {
     fn drop(&mut self) {
         let b = bindings();
         unsafe {
+            for (_, f) in self.fonts.take() {
+                b.FPDFFont_Close(f);
+            }
             b.FPDFDOC_ExitFormFillEnvironment(self.form);
             b.FPDF_CloseDocument(self.handle);
         }

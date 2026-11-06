@@ -19,15 +19,66 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// Отпечаток (hex) сертификата, которым подписывали в прошлый раз.
     pub last_cert: Option<String>,
+    /// Недавние файлы, свежие первыми.
+    pub recent: Vec<RecentFile>,
+}
+
+/// Недавний документ и страница, на которой его закрыли.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentFile {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub page: usize,
+}
+
+/// Сколько недавних файлов помнить.
+pub const RECENT_MAX: usize = 12;
+
+/// Пути Windows сравниваем без учёта регистра и вида слэшей.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+    norm(a) == norm(b)
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_update: false, last_check: None, skipped_version: None, ask_default_app: true, last_printer: None, theme: ThemeChoice::System, last_cert: None }
+        Settings {
+            auto_update: false,
+            last_check: None,
+            skipped_version: None,
+            ask_default_app: true,
+            last_printer: None,
+            theme: ThemeChoice::System,
+            last_cert: None,
+            recent: Vec::new(),
+        }
     }
 }
 
 impl Settings {
+    /// Файл открыт: поднять его в начало списка недавних (страница сохраняется).
+    pub fn touch_recent(&mut self, path: &Path) {
+        let page = self.recent_page(path).unwrap_or(0);
+        self.recent.retain(|r| !same_path(&r.path, path));
+        self.recent.insert(0, RecentFile { path: path.to_path_buf(), page });
+        self.recent.truncate(RECENT_MAX);
+    }
+
+    /// Запомнить страницу, не меняя порядок списка.
+    pub fn set_recent_page(&mut self, path: &Path, page: usize) {
+        if let Some(r) = self.recent.iter_mut().find(|r| same_path(&r.path, path)) {
+            r.page = page;
+        }
+    }
+
+    pub fn recent_page(&self, path: &Path) -> Option<usize> {
+        self.recent.iter().find(|r| same_path(&r.path, path)).map(|r| r.page)
+    }
+
+    pub fn forget_recent(&mut self, path: &Path) {
+        self.recent.retain(|r| !same_path(&r.path, path));
+    }
+
     /// Отсутствующий или повреждённый файл → значения по умолчанию.
     pub fn load(path: &Path) -> Settings {
         let Ok(text) = std::fs::read_to_string(path) else { return Settings::default() };
@@ -69,6 +120,18 @@ impl SettingsStore {
     #[cfg(test)]
     pub fn at(path: PathBuf) -> Self {
         SettingsStore { data: Settings::load(&path), path: Some(path) }
+    }
+
+    /// Правка поверх свежей копии с диска: другое окно PDFsmith могло успеть
+    /// записать свои изменения (например, свой список недавних файлов).
+    pub fn update(&mut self, f: impl FnOnce(&mut Settings)) {
+        if let Some(p) = &self.path {
+            if p.exists() {
+                self.data = Settings::load(p);
+            }
+        }
+        f(&mut self.data);
+        self.save();
     }
 
     /// Ошибка записи не фатальна: пишем в лог, работаем с настройками в памяти.
@@ -131,6 +194,7 @@ mod tests {
             last_printer: Some("Microsoft Print to PDF".into()),
             theme: ThemeChoice::Light,
             last_cert: Some("0A1B".into()),
+            recent: vec![RecentFile { path: PathBuf::from(r"C:\docs\a.pdf"), page: 3 }],
         };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
@@ -150,5 +214,36 @@ mod tests {
         store.data.auto_update = true;
         store.save(); // не паникует
         assert!(store.data.auto_update);
+    }
+
+    #[test]
+    fn recent_moves_to_front_keeps_page_and_caps() {
+        let mut s = Settings::default();
+        s.touch_recent(Path::new(r"C:\docs\a.pdf"));
+        s.touch_recent(Path::new(r"C:\docs\b.pdf"));
+        s.set_recent_page(Path::new(r"c:/DOCS/A.PDF"), 7);
+        s.touch_recent(Path::new(r"C:\Docs\A.pdf"));
+        assert_eq!(s.recent.len(), 2, "тот же файл в другом регистре не дублируется");
+        assert_eq!(s.recent[0].page, 7);
+        assert_eq!(s.recent_page(Path::new(r"C:\docs\b.pdf")), Some(0));
+        for i in 0..20 {
+            s.touch_recent(&PathBuf::from(format!(r"C:\docs\f{i}.pdf")));
+        }
+        assert_eq!(s.recent.len(), RECENT_MAX);
+        assert_eq!(s.recent[0].path, PathBuf::from(r"C:\docs\f19.pdf"));
+        s.forget_recent(Path::new(r"C:\docs\f19.pdf"));
+        assert_eq!(s.recent[0].path, PathBuf::from(r"C:\docs\f18.pdf"));
+    }
+
+    #[test]
+    fn update_merges_with_file_written_by_other_window() {
+        let p = tmp("update").join("settings.json");
+        let mut a = SettingsStore::at(p.clone());
+        let mut b = SettingsStore::at(p.clone());
+        a.update(|s| s.touch_recent(Path::new(r"C:\docs\one.pdf")));
+        b.update(|s| s.touch_recent(Path::new(r"C:\docs\two.pdf")));
+        let r = Settings::load(&p).recent;
+        assert_eq!(r.len(), 2, "второе окно не должно затирать список первого");
+        assert_eq!(r[0].path, PathBuf::from(r"C:\docs\two.pdf"));
     }
 }

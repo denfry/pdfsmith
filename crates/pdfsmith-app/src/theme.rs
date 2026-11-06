@@ -61,6 +61,8 @@ struct Palette {
     widget_hover_line: Color32,
     /// Лёгкая подсветка строки под курсором (миниатюры, списки).
     hover_wash: Color32,
+    /// Подложка групп кнопок («пилюль») на панелях.
+    group: Color32,
     /// Тень страниц и окон.
     shadow: u8,
 }
@@ -81,6 +83,7 @@ const DARK: Palette = Palette {
     widget_hover: Color32::from_rgb(0x38, 0x39, 0x40),
     widget_hover_line: Color32::from_rgb(0x48, 0x49, 0x51),
     hover_wash: Color32::from_rgba_premultiplied(10, 10, 10, 10),
+    group: Color32::from_rgb(0x29, 0x2a, 0x2f),
     shadow: 110,
 };
 
@@ -100,6 +103,7 @@ const LIGHT: Palette = Palette {
     widget_hover: Color32::from_rgb(0xea, 0xeb, 0xee),
     widget_hover_line: Color32::from_rgb(0xc4, 0xc6, 0xcc),
     hover_wash: Color32::from_rgba_premultiplied(0, 0, 0, 12),
+    group: Color32::from_rgb(0xea, 0xeb, 0xef),
     shadow: 45,
 };
 
@@ -125,6 +129,8 @@ pub fn on_accent() -> Color32 { pal().on_accent }
 pub fn danger() -> Color32 { pal().danger }
 pub fn ok() -> Color32 { pal().ok }
 pub fn hover_wash() -> Color32 { pal().hover_wash }
+pub fn group() -> Color32 { pal().group }
+pub fn widget_hover() -> Color32 { pal().widget_hover }
 /// Полупрозрачная акцентная подложка выбранной строки/миниатюры.
 pub fn accent_wash() -> Color32 {
     let a = pal().accent;
@@ -154,6 +160,8 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
     ctx.set_style_of(egui::Theme::Dark, style(ctx, &DARK, true));
     ctx.set_style_of(egui::Theme::Light, style(ctx, &LIGHT, false));
+    // Ctrl +/−/0 масштабируют документ, а не весь интерфейс (см. app::handle_keyboard).
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     set_choice(ctx, ThemeChoice::default());
 }
 
@@ -246,13 +254,7 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str, active: bool) -> eg
         btn = btn.fill(accent_dim()).stroke(Stroke::NONE);
     }
     ui.scope(|ui| {
-        let w = &mut ui.visuals_mut().widgets;
-        for s in [&mut w.inactive, &mut w.noninteractive] {
-            s.weak_bg_fill = Color32::TRANSPARENT;
-            s.bg_stroke = Stroke::NONE;
-        }
-        w.hovered.bg_stroke = Stroke::NONE;
-        w.active.bg_stroke = Stroke::NONE;
+        flat(ui);
         ui.add(btn)
     })
     .inner
@@ -275,4 +277,104 @@ pub fn vsep(ui: &mut egui::Ui) {
 /// Рамка информационной плашки под панелью инструментов.
 pub fn banner_frame() -> egui::Frame {
     egui::Frame::none().fill(accent_dim()).inner_margin(egui::Margin::symmetric(10.0, 5.0))
+}
+
+/// Группа кнопок на панели: мягкая подложка со скруглением.
+pub fn pill_frame() -> egui::Frame {
+    egui::Frame::none().fill(group()).rounding(8.0).inner_margin(egui::Margin::same(2.0))
+}
+
+/// Плавающая карточка поверх холста (подсказка инструмента, уведомление).
+pub fn float_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(panel())
+        .stroke(Stroke::new(1.0, line()))
+        .rounding(10.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+        .shadow(egui::epaint::Shadow { offset: Vec2::new(0.0, 4.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(pal().shadow / 2) })
+}
+
+/// Подпись раздела: мелкий приглушённый текст.
+pub fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).small().strong().color(muted()));
+}
+
+/// Кнопка ленты инструментов: иконка над короткой подписью.
+pub fn rail_button(ui: &mut egui::Ui, icon: &str, label: &str, tip: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(RAIL_W - 8.0, 46.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let enabled = ui.is_enabled();
+        if active {
+            p.rect_filled(rect, 8.0, accent_dim());
+        } else if resp.hovered() && enabled {
+            p.rect_filled(rect, 8.0, widget_hover());
+        }
+        let color = if !enabled {
+            muted().gamma_multiply(0.6)
+        } else if active {
+            accent()
+        } else {
+            text()
+        };
+        p.text(rect.center_top() + Vec2::new(0.0, 15.0), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(19.0), color);
+        let label_color = if active { accent() } else if enabled { muted() } else { muted().gamma_multiply(0.6) };
+        p.text(rect.center_bottom() - Vec2::new(0.0, 10.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.5), label_color);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tip)
+}
+
+/// Ширина ленты инструментов слева от холста.
+pub const RAIL_W: f32 = 64.0;
+
+/// Клавиша в справке: моноширинный текст на подложке.
+pub fn keycap(ui: &mut egui::Ui, key: &str) {
+    egui::Frame::none()
+        .fill(group())
+        .stroke(Stroke::new(1.0, line()))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(key).monospace().size(11.5).color(text()));
+        });
+}
+
+/// Цветной кружок-образец; `selected` — обведён.
+pub fn swatch(ui: &mut egui::Ui, color: Color32, selected: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if selected {
+            p.circle_stroke(rect.center(), 9.5, Stroke::new(2.0, accent()));
+        } else if resp.hovered() {
+            p.circle_stroke(rect.center(), 9.5, Stroke::new(1.0, widget_hover_line()));
+        }
+        p.circle_filled(rect.center(), 7.0, color);
+        p.circle_stroke(rect.center(), 7.0, Stroke::new(1.0, widget_hover_line()));
+    }
+    resp.on_hover_text(tip)
+}
+
+fn widget_hover_line() -> Color32 {
+    pal().widget_hover_line
+}
+
+/// Кнопки без рамки и фона в покое (внутри панелей и «пилюль»).
+pub fn flat(ui: &mut egui::Ui) {
+    let w = &mut ui.visuals_mut().widgets;
+    for s in [&mut w.inactive, &mut w.noninteractive] {
+        s.weak_bg_fill = Color32::TRANSPARENT;
+        s.bg_stroke = Stroke::NONE;
+    }
+    w.hovered.bg_stroke = Stroke::NONE;
+    w.active.bg_stroke = Stroke::NONE;
+    w.open.bg_stroke = Stroke::NONE;
+}
+
+/// Фон выбранного сегмента переключателя (поверх `group`).
+pub fn seg_active() -> Color32 {
+    if is_dark() { pal().widget_hover } else { pal().bg }
 }

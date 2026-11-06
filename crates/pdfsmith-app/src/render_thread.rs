@@ -15,9 +15,11 @@ use std::thread;
 
 use eframe::egui;
 use pdfsmith_engine::disk_cache::{self, file_id, DiskCache, Tile};
-use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderOpts, RenderedImage, Rgba};
+use pdfsmith_pdfium::{init, Document, Page, PdfRect, RenderOpts, RenderedImage, Rgba, TextChange};
 use pdfsmith_sign::{sign_pdf, store, CertInfo, SignError, SignField, SignInfo};
 
+use crate::office;
+use crate::tables;
 use crate::print::{self, PrintError, PrintJob};
 use crate::print_ui::PREVIEW_PX;
 
@@ -29,6 +31,8 @@ pub const TILE: u32 = 512;
 pub const THUMB_PX: f32 = 220.0;
 /// Сколько загруженных страниц держим одновременно.
 const LOADED_PAGES: usize = 4;
+/// Сколько снимков документа держать для отмены правок текста.
+const SNAPSHOTS: usize = 15;
 /// Сентинел LOD для миниатюр в дисковом кэше.
 const THUMB_LOD: i32 = i32::MIN + 1;
 /// Версия формата кэша: меняется при изменении рендера (например, аннотации).
@@ -69,6 +73,26 @@ pub enum EditOp {
     Highlight { page: usize, rect: DispRect, color: Rgba },
     Note { page: usize, x: f32, y: f32, text: String, color: Rgba },
     UndoAnnotation(usize),
+    /// Заменить текст объекта `index`; `expect` — текст, который видел пользователь.
+    /// Пустой `text` удаляет объект.
+    ReplaceText { page: usize, index: usize, expect: String, text: String },
+    /// Новый текст: (x, y) — левый верхний угол в display pt текущего поворота.
+    AddText { page: usize, x: f32, y: f32, text: String, size: f32, color: Rgba },
+    /// Сдвиг объекта на (dx, dy) display pt текущего поворота.
+    MoveObject { page: usize, index: usize, dx: f32, dy: f32 },
+    /// Отменить последнюю правку (пометку или правку текста); если истории
+    /// нет — последнюю аннотацию страницы `page`.
+    Undo { page: usize },
+}
+
+/// Текстовый объект для редактора: рамка в display pt при повороте 0.
+#[derive(Clone, Debug)]
+pub struct TextBox {
+    pub index: usize,
+    pub text: String,
+    pub rect: DispRect,
+    pub size: f32,
+    pub color: Rgba,
 }
 
 pub enum ImageFormat {
@@ -81,8 +105,16 @@ pub enum ConvertOp {
     PdfToText { src: PathBuf, out: PathBuf },
     ImagesToPdf { srcs: Vec<PathBuf>, out: PathBuf },
     TextToPdf { src: PathBuf, out: PathBuf },
+    /// PDF и документы Office — в один PDF (Office-файлы сначала конвертируются).
     Merge { srcs: Vec<PathBuf>, out: PathBuf },
     Split { src: PathBuf, out_dir: PathBuf },
+    /// Word/Excel/PowerPoint → PDF; один файл — в `out`, несколько — в папку `out`.
+    OfficeToPdf { srcs: Vec<PathBuf>, out: PathBuf },
+    /// Документ Office открыть в просмотрщике: конвертировать во временный PDF.
+    OpenOffice { src: PathBuf },
+    PdfToWord { src: PathBuf, out: PathBuf },
+    PdfToExcel { src: PathBuf, out: PathBuf },
+    PdfToPowerPoint { src: PathBuf, out: PathBuf },
 }
 
 /// Подпись ЭП: видимый штамп в `rect` на странице `page`, результат — в `out`.
@@ -116,6 +148,8 @@ pub enum Job {
     /// Печать; `cancel` взводит UI.
     Print { job: PrintJob, cancel: Arc<AtomicBool> },
     Sign(Box<SignJob>),
+    /// Текстовые объекты страницы для режима правки текста.
+    TextObjects { gen: u32, page: usize },
 }
 
 /// Одно вхождение поиска: страница, прямоугольники (display pt при повороте 0).
@@ -144,6 +178,9 @@ pub enum Event {
     PrintPreview { page: usize, annotations: bool, width: u32, height: u32, rgba: Vec<u8> },
     /// Печать закончилась: число отправленных листов или причина.
     PrintFinished(Result<usize, PrintError>),
+    /// Документ Office сконвертирован для просмотра: временный `pdf` из `source`.
+    OfficeOpened { pdf: PathBuf, source: PathBuf },
+    TextObjects { gen: u32, page: usize, boxes: Vec<TextBox> },
 }
 
 pub struct RenderHandle {
@@ -203,6 +240,14 @@ pub fn rotate_pt(x: f32, y: f32, rotation: u8, (w, h): (f32, f32)) -> (f32, f32)
     }
 }
 
+/// Шаг отмены.
+enum UndoStep {
+    /// Добавлена аннотация на страницу.
+    Annot(usize),
+    /// Правка содержимого: байты документа до неё.
+    Content(Vec<u8>),
+}
+
 struct Worker {
     event_tx: Sender<Event>,
     ctx: egui::Context,
@@ -214,6 +259,8 @@ struct Worker {
     dirty: bool,
     /// Страницы с несохранёнными аннотациями: дисковый кэш для них устарел.
     dirty_pages: HashSet<usize>,
+    /// История правок для Ctrl+Z (только успешные правки).
+    history: Vec<UndoStep>,
 }
 
 fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dll_dir: Option<PathBuf>) {
@@ -225,7 +272,7 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
         return;
     }
 
-    let mut w = Worker { event_tx, ctx, doc: None, path: None, disk: None, loaded: Vec::new(), dirty: false, dirty_pages: HashSet::new() };
+    let mut w = Worker { event_tx, ctx, doc: None, path: None, disk: None, loaded: Vec::new(), dirty: false, dirty_pages: HashSet::new(), history: Vec::new() };
     // Очередь задач, снятых с канала раньше времени (см. схлопывание тайлов).
     let mut pending: VecDeque<Job> = VecDeque::new();
 
@@ -302,6 +349,7 @@ fn worker(job_rx: Receiver<Job>, event_tx: Sender<Event>, ctx: egui::Context, dl
                     w.emit(Event::Error(e));
                 }
             }
+            Job::TextObjects { gen, page } => w.text_objects(gen, page),
         }
     }
 }
@@ -440,6 +488,7 @@ impl Worker {
                 // Сначала закрываем страницы старого документа, потом сам документ.
                 self.loaded.clear();
                 self.dirty_pages.clear();
+                self.history.clear();
                 self.disk = Some(disk);
                 self.doc = Some(d);
                 self.dirty = false;
@@ -581,6 +630,52 @@ impl Worker {
         Ok(PdfRect { left: ax.min(bx), bottom: ay.min(by), right: ax.max(bx), top: ay.max(by) })
     }
 
+    fn text_objects(&mut self, gen: u32, page: usize) {
+        let boxes = self.page(page).map(|pg| {
+            pg.text_objects()
+                .into_iter()
+                .map(|o| {
+                    let (x0, y0) = pg.pdf_to_display(o.rect.left, o.rect.top);
+                    let (x1, y1) = pg.pdf_to_display(o.rect.right, o.rect.bottom);
+                    TextBox {
+                        index: o.index,
+                        text: o.text,
+                        rect: DispRect { x0: x0.min(x1), y0: y0.min(y1), x1: x0.max(x1), y1: y0.max(y1) },
+                        size: o.size,
+                        color: o.color,
+                    }
+                })
+                .collect()
+        });
+        match boxes {
+            Ok(boxes) => self.emit(Event::TextObjects { gen, page, boxes }),
+            Err(e) => self.emit(Event::Error(e)),
+        }
+    }
+
+    /// Снимок документа перед правкой содержимого страницы.
+    fn snapshot(&self) -> Result<Vec<u8>, String> {
+        self.doc.as_ref().ok_or("документ не открыт")?.to_bytes().map_err(|e| e.to_string())
+    }
+
+    /// Запоминает снимок после успешной правки; старые снимки вытесняются.
+    fn push_content(&mut self, bytes: Vec<u8>) {
+        let snaps = self.history.iter().filter(|s| matches!(s, UndoStep::Content(_))).count();
+        if snaps >= SNAPSHOTS {
+            if let Some(i) = self.history.iter().position(|s| matches!(s, UndoStep::Content(_))) {
+                self.history.remove(i);
+            }
+        }
+        self.history.push(UndoStep::Content(bytes));
+    }
+
+    /// Точка display pt текущего поворота → PDF-пространство страницы.
+    fn view_to_pdf(&mut self, page: usize, rotation: u8, x: f32, y: f32) -> Result<(f32, f32), String> {
+        let size = self.doc.as_ref().and_then(|d| d.page_size(page)).ok_or("нет страницы")?;
+        let (ux, uy) = unrotate(x, y, rotation, (size.width_pt, size.height_pt));
+        Ok(self.page(page)?.display_to_pdf(ux, uy))
+    }
+
     fn copy_text(&mut self, page: usize, rotation: u8, rect: DispRect) {
         match self.disp_rect_to_pdf(page, rotation, rect) {
             Ok(r) => {
@@ -647,18 +742,21 @@ impl Worker {
                     })
                     .collect();
                 pg.add_ink(&pts, color, width).map_err(|e| e.to_string())?;
+                self.history.push(UndoStep::Annot(page));
                 self.mark_page_changed(page);
                 return Ok(());
             }
             EditOp::Rect { page, rect, color, width } => {
                 let r = self.disp_rect_to_pdf(page, rotation, rect)?;
                 self.page(page)?.add_rect(r, color, width).map_err(|e| e.to_string())?;
+                self.history.push(UndoStep::Annot(page));
                 self.mark_page_changed(page);
                 return Ok(());
             }
             EditOp::Highlight { page, rect, color } => {
                 let r = self.disp_rect_to_pdf(page, rotation, rect)?;
                 self.page(page)?.add_highlight(r, color).map_err(|e| e.to_string())?;
+                self.history.push(UndoStep::Annot(page));
                 self.mark_page_changed(page);
                 return Ok(());
             }
@@ -668,17 +766,90 @@ impl Worker {
                 let pg = self.page(page)?;
                 let (px, py) = pg.display_to_pdf(ux, uy);
                 pg.add_note(px, py, &text, color).map_err(|e| e.to_string())?;
+                self.history.push(UndoStep::Annot(page));
                 self.mark_page_changed(page);
                 return Ok(());
             }
+            EditOp::ReplaceText { page, index, expect, text } => {
+                let snap = self.snapshot()?;
+                let i = self.ensure_loaded(page)?;
+                let doc = self.doc.as_ref().unwrap();
+                let change = doc.replace_text(&self.loaded[i].1, index, &expect, &text).map_err(|e| e.to_string())?;
+                if change == TextChange::NewFont {
+                    self.emit(Event::Done("Текст изменён. В шрифте документа нет новых букв — взят похожий системный".into()));
+                }
+                self.push_content(snap);
+                self.mark_page_changed(page);
+                return Ok(());
+            }
+            EditOp::AddText { page, x, y, text, size, color } => {
+                // Базовая линия — на высоте асцента под точкой щелчка; оси строки
+                // берём из преобразования, чтобы текст стоял ровно при любом повороте.
+                let base = y + size * 0.9;
+                let o = self.view_to_pdf(page, rotation, x, base)?;
+                let rx = self.view_to_pdf(page, rotation, x + 100.0, base)?;
+                let up = self.view_to_pdf(page, rotation, x, base - 100.0)?;
+                let unit = |p: (f32, f32)| {
+                    let (dx, dy) = (p.0 - o.0, p.1 - o.1);
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-3);
+                    (dx / l, dy / l)
+                };
+                let snap = self.snapshot()?;
+                let i = self.ensure_loaded(page)?;
+                let doc = self.doc.as_ref().unwrap();
+                doc.add_text(&self.loaded[i].1, o, unit(rx), unit(up), &text, size, color).map_err(|e| e.to_string())?;
+                self.push_content(snap);
+                self.mark_page_changed(page);
+                return Ok(());
+            }
+            EditOp::MoveObject { page, index, dx, dy } => {
+                let a = self.view_to_pdf(page, rotation, 0.0, 0.0)?;
+                let b = self.view_to_pdf(page, rotation, dx, dy)?;
+                let snap = self.snapshot()?;
+                self.page(page)?.move_object(index, b.0 - a.0, b.1 - a.1).map_err(|e| e.to_string())?;
+                self.push_content(snap);
+                self.mark_page_changed(page);
+                return Ok(());
+            }
+            EditOp::Undo { page } => match self.history.pop() {
+                Some(UndoStep::Content(bytes)) => {
+                    let doc = Document::from_bytes(bytes, None).map_err(|e| e.to_string())?;
+                    self.loaded.clear();
+                    self.doc = Some(doc);
+                    // Страницы те же — сброс кэшей, но история остаётся.
+                    self.disk = None;
+                    self.dirty_pages.clear();
+                    self.dirty = true;
+                    let sizes = self.sizes();
+                    self.emit(Event::Changed { page_sizes: sizes });
+                    return Ok(());
+                }
+                Some(UndoStep::Annot(p)) => {
+                    self.page(p)?.remove_last_annotation();
+                    self.mark_page_changed(p);
+                    return Ok(());
+                }
+                None => {
+                    if !self.page(page)?.remove_last_annotation() {
+                        return Err("отменять нечего".into());
+                    }
+                    self.mark_page_changed(page);
+                    return Ok(());
+                }
+            },
             EditOp::UndoAnnotation(page) => {
                 if !self.page(page)?.remove_last_annotation() {
                     return Err("на странице нет аннотаций для отмены".into());
+                }
+                if let Some(i) = self.history.iter().rposition(|s| matches!(s, UndoStep::Annot(p) if *p == page)) {
+                    self.history.remove(i);
                 }
                 self.mark_page_changed(page);
                 return Ok(());
             }
         }
+        // Структура изменилась: снимки и номера страниц в истории устарели.
+        self.history.clear();
         self.mark_changed();
         Ok(())
     }
@@ -846,9 +1017,19 @@ impl Worker {
             }
             ConvertOp::Merge { srcs, out } => {
                 let mut doc = Document::new().map_err(|e| e.to_string())?;
+                let tmp = office::TempDir::new()?;
                 for (i, p) in srcs.iter().enumerate() {
                     self.progress(format!("Файл {}/{}", i + 1, srcs.len()), i as f32 / srcs.len().max(1) as f32);
-                    let s = Document::open(p, None).map_err(|e| format!("{}: {e}", p.display()))?;
+                    // Документы Office сначала превращаем в PDF их же программой.
+                    let pdf = if let Some(app) = office::app_for(p) {
+                        self.progress(format!("{}: {} → PDF…", i + 1, app.name()), i as f32 / srcs.len().max(1) as f32);
+                        let out = tmp.0.join(format!("{i}.pdf"));
+                        office::to_pdf(p, &out).map_err(|e| format!("{}: {e}", file_name(p)))?;
+                        out
+                    } else {
+                        p.clone()
+                    };
+                    let s = Document::open(&pdf, None).map_err(|e| format!("{}: {e}", p.display()))?;
                     let at = doc.page_count();
                     doc.import_pages(&s, &[], at).map_err(|e| e.to_string())?;
                 }
@@ -867,9 +1048,115 @@ impl Worker {
                 }
                 self.emit(Event::Done(format!("Готово: {n} файлов → {}", out_dir.display())));
             }
+            ConvertOp::OfficeToPdf { srcs, out } => {
+                self.office_job(move |progress| {
+                    if let [src] = srcs.as_slice() {
+                        progress(format!("{} → PDF…", office_name(src)), 0.3);
+                        office::to_pdf(src, &out)?;
+                        return Ok(format!("Готово: {}", out.display()));
+                    }
+                    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                    let n = srcs.len();
+                    for (i, src) in srcs.iter().enumerate() {
+                        progress(format!("{}/{n}: {} → PDF…", i + 1, office_name(src)), i as f32 / n as f32);
+                        let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("документ".into());
+                        office::to_pdf(src, &out.join(format!("{stem}.pdf"))).map_err(|e| format!("{}: {e}", file_name(src)))?;
+                    }
+                    Ok(format!("Готово: {n} PDF → {}", out.display()))
+                });
+            }
+            ConvertOp::OpenOffice { src } => {
+                let tx = self.event_tx.clone();
+                let ctx = self.ctx.clone();
+                thread::spawn(move || {
+                    let dir = std::env::temp_dir().join("PDFsmith").join("opened");
+                    let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("документ".into());
+                    let pdf = dir.join(format!("{}-{stem}.pdf", std::process::id()));
+                    let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| office::to_pdf(&src, &pdf));
+                    let _ = tx.send(match res {
+                        Ok(()) => Event::OfficeOpened { pdf, source: src },
+                        Err(e) => Event::Error(e),
+                    });
+                    ctx.request_repaint();
+                });
+            }
+            ConvertOp::PdfToWord { src, out } => {
+                self.office_job(move |progress| {
+                    progress("Word распознаёт PDF…".into(), 0.3);
+                    office::pdf_to_word(&src, &out)?;
+                    Ok(format!("Готово: {}", out.display()))
+                });
+            }
+            ConvertOp::PdfToExcel { src, out } => {
+                // Строки и колонки — по геометрии текста; Office для этого не нужен.
+                let doc = Document::open(&src, None).map_err(|e| e.to_string())?;
+                let n = doc.page_count();
+                let mut rows = Vec::new();
+                for i in 0..n {
+                    self.progress(format!("Таблицы: страница {}/{n}", i + 1), i as f32 / n.max(1) as f32);
+                    let pg = doc.load_page(i).map_err(|e| e.to_string())?;
+                    if i > 0 {
+                        rows.push(Vec::new());
+                    }
+                    rows.extend(tables::page_rows(&pg.chars()));
+                }
+                if rows.iter().all(|r| r.is_empty()) {
+                    return Err("В PDF нет текстового слоя (похоже на скан) — выгружать в Excel нечего".into());
+                }
+                tables::write_xlsx(&out, &rows).map_err(|e| format!("{}: {e}", out.display()))?;
+                self.emit(Event::Done(format!("Готово: {}", out.display())));
+            }
+            ConvertOp::PdfToPowerPoint { src, out } => {
+                // Картинки страниц рисует PDFium (здесь), слайды собирает PowerPoint (в фоне).
+                let doc = Document::open(&src, None).map_err(|e| e.to_string())?;
+                let tmp = office::TempDir::new()?;
+                let n = doc.page_count();
+                let slide = doc.page_size(0).map(|s| (s.width_pt, s.height_pt)).unwrap_or((842.0, 595.0));
+                for i in 0..n {
+                    self.progress(format!("Слайд {}/{n}", i + 1), 0.5 * i as f32 / n.max(1) as f32);
+                    let img = doc.render_page_scaled(i, 160.0 / 72.0).map_err(|e| e.to_string())?;
+                    save_image(&img, &tmp.0.join(format!("page{:05}.png", i + 1)), &ImageFormat::Png)?;
+                }
+                drop(doc);
+                self.office_job(move |progress| {
+                    progress("PowerPoint собирает слайды…".into(), 0.6);
+                    office::images_to_pptx(&tmp.0, slide, &out)?;
+                    Ok(format!("Готово: {n} слайдов → {}", out.display()))
+                });
+            }
         }
         Ok(())
     }
+
+    /// Работа с Office — в отдельном потоке: Office думает секундами, а просмотр
+    /// документа (тайлы, миниатюры) не должен замирать.
+    fn office_job(&self, f: impl FnOnce(&dyn Fn(String, f32)) -> Result<String, String> + Send + 'static) {
+        let tx = self.event_tx.clone();
+        let ctx = self.ctx.clone();
+        thread::Builder::new()
+            .name("office".into())
+            .spawn(move || {
+                let progress = |msg: String, frac: f32| {
+                    let _ = tx.send(Event::Progress { msg, frac });
+                    ctx.request_repaint();
+                };
+                let ev = match f(&progress) {
+                    Ok(msg) => Event::Done(msg),
+                    Err(e) => Event::Error(e),
+                };
+                let _ = tx.send(ev);
+                ctx.request_repaint();
+            })
+            .expect("поток office");
+    }
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+fn office_name(p: &std::path::Path) -> &'static str {
+    office::app_for(p).map(|a| a.name()).unwrap_or("Office")
 }
 
 fn save_image(img: &RenderedImage, path: &std::path::Path, format: &ImageFormat) -> Result<(), String> {
@@ -991,6 +1278,73 @@ mod tests {
             }
         }
         assert_eq!(got.len(), total, "тайлы потерялись после миниатюр: {}/{total}", got.len());
+    }
+
+    /// Правка текста через рендер-поток: замена, новый текст, затем Ctrl+Z
+    /// по шагам возвращает исходную страницу; аннотации отменяются в общем порядке.
+    #[test]
+    fn text_edit_and_undo_history() {
+        let _serial = pdfium_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let pdf = root.join("test_pdfs").join("text.pdf");
+        if !root.join("pdfium.dll").exists() || !pdf.exists() {
+            eprintln!("ПРОПУСК: нет pdfium.dll или test_pdfs/text.pdf");
+            return;
+        }
+        let h = spawn(egui::Context::default(), Some(root));
+        let wait = |pred: &dyn Fn(&Event) -> bool| loop {
+            let ev = h.event_rx.recv_timeout(std::time::Duration::from_secs(15)).expect("нет события");
+            if let Event::Error(e) = &ev {
+                panic!("{e}");
+            }
+            if pred(&ev) {
+                return ev;
+            }
+        };
+        let boxes = |h: &RenderHandle| {
+            h.job_tx.send(Job::TextObjects { gen: 7, page: 0 }).unwrap();
+            match wait(&|e| matches!(e, Event::TextObjects { .. })) {
+                Event::TextObjects { gen, boxes, .. } => {
+                    assert_eq!(gen, 7);
+                    boxes
+                }
+                _ => unreachable!(),
+            }
+        };
+        h.job_tx.send(Job::Open(pdf)).unwrap();
+        wait(&|e| matches!(e, Event::Opened { .. }));
+        let before: Vec<String> = boxes(&h).into_iter().map(|b| b.text).collect();
+        let first = boxes(&h).into_iter().find(|b| b.text.chars().count() >= 4).unwrap();
+        assert!(first.rect.x1 > first.rect.x0 && first.size > 4.0);
+
+        let edit = |op| h.job_tx.send(Job::Edit { op, rotation: 0 }).unwrap();
+        edit(EditOp::ReplaceText { page: 0, index: first.index, expect: first.text.clone(), text: "Новая строка 42".into() });
+        wait(&|e| matches!(e, Event::PageChanged { page: 0 }));
+        edit(EditOp::Highlight { page: 0, rect: DispRect { x0: 50.0, y0: 50.0, x1: 200.0, y1: 70.0 }, color: Rgba(255, 220, 0, 255) });
+        wait(&|e| matches!(e, Event::PageChanged { page: 0 }));
+        edit(EditOp::AddText { page: 0, x: 60.0, y: 700.0, text: "Подпись внизу".into(), size: 14.0, color: Rgba(0, 0, 0, 255) });
+        wait(&|e| matches!(e, Event::PageChanged { page: 0 }));
+        let now: Vec<String> = boxes(&h).into_iter().map(|b| b.text).collect();
+        assert!(now.iter().any(|t| t.trim() == "Новая строка 42"), "{now:?}");
+        let added = boxes(&h).into_iter().find(|b| b.text == "Подпись внизу").expect("новый текст");
+        assert!((added.rect.x0 - 60.0).abs() < 3.0 && added.rect.y0 > 695.0 && added.rect.y0 < 720.0, "{:?}", added.rect);
+
+        // Ctrl+Z ×3: новый текст, маркер, замена.
+        edit(EditOp::Undo { page: 0 });
+        wait(&|e| matches!(e, Event::Changed { .. }));
+        assert!(!boxes(&h).iter().any(|b| b.text == "Подпись внизу"));
+        edit(EditOp::Undo { page: 0 });
+        wait(&|e| matches!(e, Event::PageChanged { page: 0 }));
+        edit(EditOp::Undo { page: 0 });
+        wait(&|e| matches!(e, Event::Changed { .. }));
+        let after: Vec<String> = boxes(&h).into_iter().map(|b| b.text).collect();
+        assert_eq!(after, before);
+        // История пуста, аннотаций нет — отменять нечего.
+        edit(EditOp::Undo { page: 0 });
+        match h.event_rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap() {
+            Event::Error(e) => assert!(e.contains("нечего"), "{e}"),
+            _ => panic!("ожидалась ошибка «нечего отменять»"),
+        }
     }
 
     #[test]

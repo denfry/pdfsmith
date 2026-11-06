@@ -10,13 +10,18 @@ use std::path::PathBuf;
 use eframe::egui;
 
 mod app;
+mod convert_ui;
 mod default_app;
+mod devshot;
+mod home;
+mod office;
 mod print;
 mod print_ui;
 mod render_thread;
 mod settings;
 mod settings_ui;
 mod sign_ui;
+mod tables;
 mod theme;
 mod updates;
 

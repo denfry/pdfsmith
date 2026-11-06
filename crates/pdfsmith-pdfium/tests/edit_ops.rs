@@ -151,3 +151,58 @@ fn ink_survives_page_reload_and_keeps_content() {
     assert!(count_dark(&after) * 2 > count_dark(&before), "исходное содержимое пропало после штриха");
     assert!(count_red(&after) > 50, "штрих не отрисовался");
 }
+
+#[test]
+fn text_objects_edit_add_move_remove_survive_save() {
+    use pdfsmith_pdfium::TextChange;
+    let _g = serial();
+    let Some(pdf) = sample() else { return };
+    let doc = Document::open(&pdf, None).unwrap();
+    let page = doc.load_page(0).unwrap();
+    let objs = page.text_objects();
+    assert!(!objs.is_empty(), "в text.pdf должны быть текстовые объекты");
+    for o in &objs {
+        eprintln!("#{} {:?} {:.1}pt {} b={} i={}", o.index, o.text, o.size, o.font, o.bold, o.italic);
+    }
+
+    // Перестановка своих же символов — остаётся исходный шрифт.
+    let a = objs.iter().find(|o| o.text.chars().count() >= 4).unwrap().clone();
+    let rev: String = a.text.chars().rev().collect();
+    assert_eq!(doc.replace_text(&page, a.index, &a.text, &rev).unwrap(), TextChange::KeptFont);
+
+    // Новые символы — системный шрифт, тот же объект по индексу.
+    let objs = page.text_objects();
+    let b = objs.iter().find(|o| o.index != a.index && o.text.chars().count() >= 2).unwrap().clone();
+    let fresh = "Ёжик ЪЩ 0123 qwz";
+    assert!(matches!(doc.replace_text(&page, b.index, &b.text, fresh).unwrap(), TextChange::NewFont | TextChange::KeptFont));
+    let after = page.text_objects();
+    let nb = after.iter().find(|o| o.text == fresh).expect("новый текст на месте");
+    assert!((nb.rect.left - b.rect.left).abs() < 2.0, "{} vs {}", nb.rect.left, b.rect.left);
+    assert!((nb.size - b.size).abs() < 0.1);
+
+    // Устаревший expect отклоняется.
+    assert!(doc.replace_text(&page, nb.index, "не то", "x").is_err());
+
+    // Перенос.
+    page.move_object(nb.index, 10.0, -5.0).unwrap();
+    let moved = page.text_objects().into_iter().find(|o| o.text == fresh).unwrap();
+    assert!((moved.rect.left - nb.rect.left - 10.0).abs() < 0.5);
+
+    // Новый текст и удаление.
+    doc.add_text(&page, (72.0, 72.0), (1.0, 0.0), (0.0, 1.0), "Добавлено pdfsmith", 14.0, Rgba(200, 0, 0, 255)).unwrap();
+    let c = objs.iter().find(|o| o.index != a.index && o.index != b.index).unwrap().clone();
+    let c_now = page.text_objects().into_iter().find(|o| o.text == c.text).unwrap();
+    assert_eq!(doc.replace_text(&page, c_now.index, &c_now.text, "  ").unwrap(), TextChange::Removed);
+
+    // Всё переживает сохранение.
+    let bytes = doc.to_bytes().unwrap();
+    drop(page);
+    drop(doc);
+    let back = Document::from_bytes(bytes, None).unwrap();
+    let texts: Vec<String> = back.load_page(0).unwrap().text_objects().into_iter().map(|o| o.text).collect();
+    assert!(texts.iter().any(|t| t.trim() == rev.trim()), "{texts:?}");
+    assert!(texts.iter().any(|t| t == fresh));
+    assert!(texts.iter().any(|t| t == "Добавлено pdfsmith"));
+    let all = back.load_page(0).unwrap().text();
+    assert!(all.contains("Добавлено pdfsmith"));
+}

@@ -14,16 +14,18 @@ use pdfsmith_engine::lod::lod_scale_for;
 use pdfsmith_engine::viewport::visible_tiles_center_out;
 use pdfsmith_pdfium::Rgba;
 
+use crate::convert_ui::{has_ext, ConvertDialog, ConvertMode, IMAGE_EXTS};
 use crate::default_app::DefaultApp;
+use crate::home::{self, HomeAction};
+use crate::office;
 use crate::print::PrintError;
 use crate::print_ui::{DocInfo, PrintDialog, PrintRequest};
 use crate::render_thread::{
-    rotate_pt, spawn, ConvertOp, DispRect, EditOp, Event, ImageFormat, Job, PageTiles, RenderHandle,
-    SearchHit, SignJob, TILE,
+    rotate_pt, spawn, ConvertOp, DispRect, EditOp, Event, Job, PageTiles, RenderHandle, SearchHit, SignJob, TextBox, TILE,
 };
 use crate::settings::SettingsStore;
 use crate::sign_ui::{hex, SignChoice, SignDialog};
-use crate::theme::{self, icon_button, vsep};
+use crate::theme::{self, icon_button, rail_button, vsep};
 use crate::updates::{UpdState, UpdateUi};
 
 const MIN_LOD: i32 = -4;
@@ -40,6 +42,36 @@ const GAP_PT: f32 = 14.0;
 /// Поле вокруг документа на холсте (экранные px).
 const MARGIN_PX: f32 = 18.0;
 const SIDEBAR_W: f32 = 236.0;
+/// Высота строки результата поиска в боковой панели.
+const HIT_ROW_H: f32 = 44.0;
+
+/// Цвета пера и рамки.
+const PEN_COLORS: [(Color32, &str); 5] = [
+    (Color32::from_rgb(0xe0, 0x3c, 0x31), "Красный"),
+    (Color32::from_rgb(0x25, 0x63, 0xeb), "Синий"),
+    (Color32::from_rgb(0x16, 0xa3, 0x4a), "Зелёный"),
+    (Color32::from_rgb(0xf5, 0x9e, 0x0b), "Оранжевый"),
+    (Color32::from_rgb(0x1d, 0x1e, 0x22), "Чёрный"),
+];
+/// Цвета маркера.
+const MARKER_COLORS: [(Color32, &str); 4] = [
+    (Color32::from_rgb(255, 224, 64), "Жёлтый"),
+    (Color32::from_rgb(140, 230, 120), "Зелёный"),
+    (Color32::from_rgb(255, 150, 200), "Розовый"),
+    (Color32::from_rgb(120, 200, 255), "Голубой"),
+];
+
+/// Инструменты ленты: инструмент, иконка, подпись, подсказка.
+const TOOLS: [(Tool, &str, &str, &str); 8] = [
+    (Tool::Hand, ph::HAND, "Рука", "Рука: двигать страницы  (H)"),
+    (Tool::Select, ph::CURSOR_TEXT, "Текст", "Выделить и скопировать текст  (T)"),
+    (Tool::EditText, ph::TEXT_T, "Правка", "Править, добавлять и двигать текст в самом PDF  (E)"),
+    (Tool::Highlight, ph::HIGHLIGHTER, "Маркер", "Выделить маркером  (M)"),
+    (Tool::Pen, ph::PEN, "Перо", "Рисовать от руки  (P)"),
+    (Tool::Rect, ph::RECTANGLE, "Рамка", "Обвести рамкой  (R)"),
+    (Tool::Note, ph::CHAT_TEXT, "Заметка", "Заметка-стикер  (N)"),
+    (Tool::Sign, ph::SEAL_CHECK, "Подпись", "Электронная подпись: КриптоПро, токены  (G)"),
+];
 const THUMB_INFLIGHT: usize = 2;
 
 /// Ключ тайла-текстуры: (страница, поворот, LOD, столбец, строка).
@@ -55,6 +87,23 @@ enum Tool {
     Note,
     /// Подпись ЭП: обвести место штампа.
     Sign,
+    /// Правка текста страницы: изменить, добавить, перенести.
+    EditText,
+}
+
+/// Открытый встроенный редактор текста на странице.
+struct TextEditing {
+    page: usize,
+    /// Объект страницы; `None` — новый текст.
+    index: Option<usize>,
+    original: String,
+    text: String,
+    /// Место редактора: display pt текущего поворота (x0, y0, x1, y1).
+    at: (f32, f32, f32, f32),
+    size: f32,
+    color: Color32,
+    id: egui::Id,
+    focused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,6 +130,8 @@ enum Drag {
     /// Прямоугольник: страница, начало (display pt), текущая точка.
     Rect { page: usize, start: (f32, f32), cur: (f32, f32) },
     Ink { page: usize, points: Vec<(f32, f32)> },
+    /// Перенос текстового объекта: точка захвата и текущая (display pt).
+    Move { page: usize, index: usize, start: (f32, f32), cur: (f32, f32) },
 }
 
 /// Фигура аннотации поверх страницы (display pt текущего поворота).
@@ -88,6 +139,8 @@ enum Mark {
     Ink(Vec<(f32, f32)>),
     Frame((f32, f32), (f32, f32)),
     Marker((f32, f32), (f32, f32)),
+    /// Правка текста до перерисовки: закрасить `cover` и написать `text` в точке.
+    Text { cover: Option<(f32, f32, f32, f32)>, at: (f32, f32), text: String, size: f32 },
 }
 
 /// Только что нарисованная аннотация: видна, пока страница не перерисуется
@@ -99,59 +152,6 @@ struct Ghost {
     width: f32,
     /// Рендер-поток подтвердил правку (`PageChanged`).
     armed: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConvertMode {
-    PdfToImages,
-    PdfToText,
-    ImagesToPdf,
-    TextToPdf,
-    Merge,
-    Split,
-}
-
-impl ConvertMode {
-    const ALL: [ConvertMode; 6] = [
-        ConvertMode::PdfToImages,
-        ConvertMode::PdfToText,
-        ConvertMode::ImagesToPdf,
-        ConvertMode::TextToPdf,
-        ConvertMode::Merge,
-        ConvertMode::Split,
-    ];
-    fn label(self) -> &'static str {
-        match self {
-            ConvertMode::PdfToImages => "PDF → изображения (PNG/JPEG)",
-            ConvertMode::PdfToText => "PDF → текст (.txt)",
-            ConvertMode::ImagesToPdf => "Изображения → PDF",
-            ConvertMode::TextToPdf => "Текст (.txt) → PDF",
-            ConvertMode::Merge => "Объединить PDF",
-            ConvertMode::Split => "Разделить PDF по страницам",
-        }
-    }
-    fn multi_input(self) -> bool {
-        matches!(self, ConvertMode::ImagesToPdf | ConvertMode::Merge)
-    }
-    fn input_filter(self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            ConvertMode::ImagesToPdf => ("Изображения", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"]),
-            ConvertMode::TextToPdf => ("Текст", &["txt", "md", "log", "csv"]),
-            _ => ("PDF", &["pdf"]),
-        }
-    }
-    fn output_is_dir(self) -> bool {
-        matches!(self, ConvertMode::PdfToImages | ConvertMode::Split)
-    }
-}
-
-struct ConvertDialog {
-    open: bool,
-    mode: ConvertMode,
-    inputs: Vec<PathBuf>,
-    output: Option<PathBuf>,
-    jpeg: bool,
-    dpi: f32,
 }
 
 struct View {
@@ -194,6 +194,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_thread::ImageFormat;
 
     #[test]
     fn layout_stacks_pages_and_centers_narrow_ones() {
@@ -464,6 +465,22 @@ pub struct ViewerApp {
     tool: Tool,
     pen_color: Color32,
     pen_width: f32,
+    marker_color: Color32,
+    /// Правка текста: объекты видимых страниц, запрошенные страницы, редактор.
+    text_boxes: HashMap<usize, Vec<TextBox>>,
+    text_requested: HashSet<usize>,
+    text_edit: Option<TextEditing>,
+    /// Кегль и цвет нового текста.
+    text_size: f32,
+    text_color: Color32,
+    /// Файл, который сейчас открывается (для экрана загрузки).
+    opening: Option<PathBuf>,
+    /// Документ сконвертирован из Office и ещё не сохранён: куда предложить сохранить.
+    untitled: Option<PathBuf>,
+    /// Область под центральной панелью: к ней привязаны уведомления и подсказки.
+    central: Rect,
+    /// Прокрутить список результатов поиска к этому совпадению.
+    search_scroll_to: Option<usize>,
     // Боковая панель.
     show_sidebar: bool,
     side_tab: SideTab,
@@ -501,6 +518,8 @@ pub struct ViewerApp {
     upd: UpdateUi,
     def_app: DefaultApp,
     show_settings: bool,
+    /// Отладочный снимок окна (см. `devshot`).
+    shot: Option<crate::devshot::DevShot>,
 }
 
 impl ViewerApp {
@@ -512,14 +531,17 @@ impl ViewerApp {
         theme::set_choice(&cc.egui_ctx, app.store.data.theme);
         app.upd = UpdateUi::new(&cc.egui_ctx, &app.store);
         app.def_app = DefaultApp::detect();
+        app.shot = crate::devshot::DevShot::from_env();
         app
     }
 
     /// Создание без eframe (тесты): контекст egui и папка с `pdfium.dll`.
     pub fn with_context(ctx: egui::Context, dll_dir: Option<PathBuf>, path: Option<PathBuf>) -> Self {
         let handle = spawn(ctx, dll_dir);
+        let path = path.map(|p| std::path::absolute(&p).unwrap_or(p));
         if let Some(p) = &path {
-            let _ = handle.job_tx.send(Job::Open(p.clone()));
+            let job = if office::app_for(p).is_some() { Job::Convert(ConvertOp::OpenOffice { src: p.clone() }) } else { Job::Open(p.clone()) };
+            let _ = handle.job_tx.send(job);
         }
         ViewerApp {
             handle,
@@ -542,8 +564,18 @@ impl ViewerApp {
             pending: Vec::new(),
             drag: None,
             tool: Tool::Hand,
-            pen_color: Color32::from_rgb(0xe0, 0x3c, 0x31),
+            pen_color: PEN_COLORS[0].0,
             pen_width: 2.5,
+            marker_color: MARKER_COLORS[0].0,
+            text_boxes: HashMap::new(),
+            text_requested: HashSet::new(),
+            text_edit: None,
+            text_size: 12.0,
+            text_color: Color32::BLACK,
+            opening: path.clone(),
+            untitled: None,
+            central: Rect::NOTHING,
+            search_scroll_to: None,
             show_sidebar: true,
             side_tab: SideTab::Pages,
             thumbs: HashMap::new(),
@@ -559,14 +591,7 @@ impl ViewerApp {
             searching: false,
             goto_text: String::new(),
             note_dialog: None,
-            convert: ConvertDialog {
-                open: false,
-                mode: ConvertMode::PdfToImages,
-                inputs: Vec::new(),
-                output: None,
-                jpeg: false,
-                dpi: 150.0,
-            },
+            convert: ConvertDialog::default(),
             close_dialog: false,
             show_help: false,
             print: PrintDialog::default(),
@@ -579,6 +604,7 @@ impl ViewerApp {
             upd: UpdateUi::disabled(),
             def_app: DefaultApp::disabled(),
             show_settings: false,
+            shot: None,
         }
     }
 
@@ -604,13 +630,78 @@ impl ViewerApp {
         self.order.clear();
         self.stale.clear();
         self.ghosts.clear();
+        self.text_boxes.clear();
+        self.text_requested.clear();
+        self.text_edit = None;
         self.thumbs.clear();
         self.thumb_requested.clear();
         self.thumb_inflight = 0;
         self.last_request = None;
     }
 
+    /// Запомнить страницу текущего документа в списке недавних.
+    fn remember_page(&mut self) {
+        if let (true, Some(p)) = (self.opened, self.path.clone()) {
+            let page = self.current_page;
+            self.store.update(|s| s.set_recent_page(&p, page));
+        }
+    }
+
+    fn open_dialog(&mut self) {
+        let mut all = vec!["pdf"];
+        all.extend_from_slice(office::OFFICE_EXTS);
+        let mut d = rfd::FileDialog::new()
+            .add_filter("PDF и документы Office", &all)
+            .add_filter("PDF", &["pdf"])
+            .add_filter("Word", office::WORD_EXTS)
+            .add_filter("Excel", office::EXCEL_EXTS)
+            .add_filter("PowerPoint", office::POWERPOINT_EXTS);
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(p) = d.pick_file() {
+            self.open_path(p);
+        }
+    }
+
+    fn open_recent(&mut self, p: PathBuf) {
+        if p.exists() {
+            self.open_path(p);
+        } else {
+            self.store.update(|s| s.forget_recent(&p));
+            self.set_status("Файл не найден — он убран из недавних", true);
+        }
+    }
+
+    fn home_action(&mut self, a: HomeAction) {
+        match a {
+            HomeAction::OpenDialog => self.open_dialog(),
+            HomeAction::Open(p) => self.open_recent(p),
+            HomeAction::Forget(p) => self.store.update(|s| s.forget_recent(&p)),
+            HomeAction::Convert(m) => {
+                self.convert.open_with(m, Vec::new());
+                self.convert.pick_inputs();
+            }
+        }
+    }
+
     fn open_path(&mut self, path: PathBuf) {
+        // Абсолютный путь: иначе список недавних сломается при запуске из другой папки.
+        let path = std::path::absolute(&path).unwrap_or(path);
+        self.remember_page();
+        self.opening = Some(path.clone());
+        self.untitled = None;
+        if let Some(app) = office::app_for(&path) {
+            // Документ Office: сначала PDF его же программой, потом откроем (OfficeOpened).
+            self.error = None;
+            self.opened = false;
+            if !office::available(app) {
+                self.error = Some(format!("Для открытия этого файла нужен Microsoft {} — он не найден на компьютере", app.name()));
+                return;
+            }
+            let _ = self.handle.job_tx.send(Job::Convert(ConvertOp::OpenOffice { src: path }));
+            return;
+        }
         self.reset_caches();
         self.error = None;
         self.opened = false;
@@ -644,9 +735,11 @@ impl ViewerApp {
         if !self.opened {
             return;
         }
-        let target = if save_as || self.path.is_none() {
+        // Незакрытый редактор текста — сначала применить (задания идут по порядку).
+        self.commit_text_edit();
+        let target = if save_as || self.path.is_none() || self.untitled.is_some() {
             let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]);
-            if let Some(p) = &self.path {
+            if let Some(p) = self.untitled.as_ref().or(self.path.as_ref()) {
                 if let Some(name) = p.file_name() {
                     d = d.set_file_name(name.to_string_lossy());
                 }
@@ -665,7 +758,7 @@ impl ViewerApp {
     }
 
     fn title(&self) -> String {
-        match &self.path {
+        match self.untitled.as_ref().or(self.path.as_ref()) {
             Some(p) => format!(
                 "{}{} — pdfsmith",
                 if self.dirty { "• " } else { "" },
@@ -688,11 +781,22 @@ impl ViewerApp {
             let Ok(ev) = self.handle.event_rx.try_recv() else { break };
             match ev {
                 Event::Opened { path, page_sizes } => {
+                    let n = page_sizes.len();
+                    let mut restore = 0;
+                    if self.untitled.is_none() {
+                        self.store.update(|s| {
+                            restore = s.recent_page(&path).unwrap_or(0);
+                            s.touch_recent(&path);
+                        });
+                    }
                     self.page_sizes = page_sizes;
                     self.path = Some(path);
+                    self.opening = None;
                     self.opened = true;
-                    self.dirty = false;
-                    self.current_page = 0;
+                    // Сконвертированный из Office документ лежит во временной папке — он не сохранён.
+                    self.dirty = self.untitled.is_some();
+                    // Открываем там, где закончили в прошлый раз.
+                    self.current_page = restore.min(n.saturating_sub(1));
                     self.view_pending = true;
                     self.rebuild_layout();
                     self.view.needs_fit = true;
@@ -714,6 +818,8 @@ impl ViewerApp {
                 }
                 Event::PageChanged { page } => {
                     self.dirty = true;
+                    self.text_boxes.remove(&page);
+                    self.text_requested.remove(&page);
                     // Старые тайлы страницы показываем, пока не придут новые.
                     self.stale.extend(self.textures.keys().filter(|k| k.0 == page).copied());
                     self.last_request = None;
@@ -751,6 +857,8 @@ impl ViewerApp {
                     self.thumbs.insert((page, rotation), tex);
                 }
                 Event::Saved(path) => {
+                    self.store.update(|s| s.touch_recent(&path));
+                    self.untitled = None;
                     self.dirty = false;
                     self.path = Some(path.clone());
                     self.set_status(format!("Сохранено: {}", path.display()), false);
@@ -767,6 +875,7 @@ impl ViewerApp {
                     let n = hits.len();
                     self.hits = hits;
                     self.active_hit = if n > 0 { Some(0) } else { None };
+                    self.search_scroll_to = self.active_hit;
                     if let Some(h) = self.hits.first() {
                         if let Some(r) = h.rects.first() {
                             let (x, y) = self.hit_center(h.page, r);
@@ -806,11 +915,23 @@ impl ViewerApp {
                     self.progress = None;
                     self.searching = false;
                     self.thumb_inflight = 0;
-                    if self.opened {
-                        self.set_status(e, true);
-                    } else {
+                    // Экран ошибки — только если не открылся документ; прочее — уведомлением.
+                    if !self.opened && self.opening.is_some() {
                         self.error = Some(e);
+                    } else {
+                        self.set_status(e, true);
                     }
+                }
+                Event::TextObjects { gen, page, boxes } => {
+                    if gen == self.gen {
+                        self.text_boxes.insert(page, boxes);
+                    }
+                }
+                Event::OfficeOpened { pdf, source } => {
+                    self.store.update(|s| s.touch_recent(&source));
+                    self.open_path(pdf);
+                    self.untitled = Some(source.with_extension("pdf"));
+                    self.opening = Some(source);
                 }
             }
         }
@@ -839,9 +960,21 @@ impl ViewerApp {
         Rect::from_min_size(min.to_pos2(), Vec2::new(w, h) * self.view.zoom)
     }
 
+    /// Страницы, задевающие полосу экрана `y0..=y1`. Раскладка идёт сверху вниз,
+    /// поэтому хватает двоичного поиска — без обхода всех страниц каждый кадр.
+    fn pages_in(&self, y0: f32, y1: f32) -> std::ops::Range<usize> {
+        let z = self.view.zoom;
+        let top = (y0 - self.view.offset.y) / z;
+        let bottom = (y1 - self.view.offset.y) / z;
+        let r = &self.layout.rects;
+        let first = r.partition_point(|&(_, t, _, h)| t + h < top);
+        let last = r.partition_point(|&(_, t, _, _)| t <= bottom);
+        first..last.max(first)
+    }
+
     /// Экранная точка → (страница, x, y в display pt), если попала на страницу.
     fn page_at(&self, pos: Pos2) -> Option<(usize, f32, f32)> {
-        for i in 0..self.layout.rects.len() {
+        for i in self.pages_in(pos.y, pos.y) {
             let r = self.page_screen_rect(i);
             if r.contains(pos) {
                 let rel = (pos - r.min) / self.view.zoom;
@@ -917,14 +1050,8 @@ impl ViewerApp {
     /// Текущая страница — с наибольшей видимой площадью (при равенстве — верхняя).
     fn update_current_page(&mut self, canvas: Rect) {
         let mut best = (0.0f32, self.current_page);
-        for i in 0..self.layout.rects.len() {
+        for i in self.pages_in(canvas.top(), canvas.bottom()) {
             let r = self.page_screen_rect(i);
-            if r.bottom() < canvas.top() {
-                continue;
-            }
-            if r.top() > canvas.bottom() {
-                break;
-            }
             let vis = r.intersect(canvas);
             let area = if vis.is_positive() { vis.area() } else { 0.0 };
             if area > best.0 {
@@ -979,9 +1106,7 @@ impl ViewerApp {
                 )
             });
             if o {
-                if let Some(p) = pick_pdf() {
-                    self.open_path(p);
-                }
+                self.open_dialog();
             }
             if s {
                 self.save(mods.shift);
@@ -992,7 +1117,7 @@ impl ViewerApp {
                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("search_field")));
             }
             if z && self.opened && !typing {
-                self.edit(EditOp::UndoAnnotation(self.current_page));
+                self.edit(EditOp::Undo { page: self.current_page });
             }
             if p && self.opened {
                 self.open_print();
@@ -1003,7 +1128,38 @@ impl ViewerApp {
             if w {
                 self.show_sidebar = !self.show_sidebar;
             }
+            // Масштаб документа (интерфейс по Ctrl +/− не масштабируется, см. theme::install).
+            if self.opened && !typing {
+                let (plus, minus, k0, k1, k2) = ctx.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                        i.key_pressed(egui::Key::Minus),
+                        i.key_pressed(egui::Key::Num0),
+                        i.key_pressed(egui::Key::Num1),
+                        i.key_pressed(egui::Key::Num2),
+                    )
+                });
+                if plus {
+                    self.pending.push(Action::Zoom(ZOOM_STEP));
+                }
+                if minus {
+                    self.pending.push(Action::Zoom(1.0 / ZOOM_STEP));
+                }
+                if k0 {
+                    self.pending.push(Action::FitPage);
+                }
+                if k1 {
+                    self.pending.push(Action::ActualSize);
+                }
+                if k2 {
+                    self.pending.push(Action::FitWidth);
+                }
+            }
             return;
+        }
+        // F3 работает и из поля поиска.
+        if let Some(back) = ctx.input(|i| i.key_pressed(egui::Key::F3).then_some(i.modifiers.shift)) {
+            self.step_hit(if back { -1 } else { 1 });
         }
         if typing {
             return;
@@ -1055,14 +1211,28 @@ impl ViewerApp {
                 self.pending.push(Action::ScrollBy(Vec2::new(0.0, if i.modifiers.shift { 400.0 } else { -400.0 })));
             }
             if k(egui::Key::Escape) {
-                self.tool = Tool::Hand;
-                self.drag = None;
+                // Сначала закрываем открытое окно, потом сбрасываем инструмент.
+                if self.text_edit.is_some() {
+                    // Редактор текста закрывается сам.
+                } else if self.show_help {
+                    self.show_help = false;
+                } else if self.convert.open {
+                    self.convert.open = false;
+                } else if self.show_settings {
+                    self.show_settings = false;
+                } else {
+                    self.tool = Tool::Hand;
+                    self.drag = None;
+                }
             }
             if k(egui::Key::H) {
                 self.tool = Tool::Hand;
             }
             if k(egui::Key::T) {
                 self.tool = Tool::Select;
+            }
+            if k(egui::Key::E) {
+                self.tool = Tool::EditText;
             }
             if k(egui::Key::P) {
                 self.tool = Tool::Pen;
@@ -1079,17 +1249,6 @@ impl ViewerApp {
             if k(egui::Key::G) {
                 self.tool = Tool::Sign;
             }
-            if k(egui::Key::F3) && !self.hits.is_empty() {
-                let n = self.hits.len();
-                let cur = self.active_hit.unwrap_or(0);
-                let next = if i.modifiers.shift { (cur + n - 1) % n } else { (cur + 1) % n };
-                self.active_hit = Some(next);
-                let h = &self.hits[next];
-                if let Some(r) = h.rects.first() {
-                    let (x, y) = self.hit_center(h.page, r);
-                    self.pending.push(Action::Reveal(h.page, x, y));
-                }
-            }
             if k(egui::Key::F1) {
                 self.show_help = !self.show_help;
             }
@@ -1102,32 +1261,62 @@ impl ViewerApp {
         if paths.is_empty() {
             return;
         }
-        let is_pdf = |p: &PathBuf| p.extension().map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false);
-        let is_img = |p: &PathBuf| {
-            p.extension()
-                .map(|e| {
-                    let e = e.to_string_lossy().to_ascii_lowercase();
-                    matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff" | "webp")
-                })
-                .unwrap_or(false)
-        };
-        if let Some(p) = paths.iter().find(|p| is_pdf(p)) {
+        if self.convert.open {
+            if !self.convert.add_dropped(paths) {
+                self.set_status(format!("Эти файлы не подходят для операции «{}»", self.convert.mode.label()), true);
+            }
+            return;
+        }
+        let office_n = paths.iter().filter(|p| office::app_for(p).is_some()).count();
+        if office_n > 0 {
+            // Один документ Office — открыть как PDF; несколько файлов — собрать в один.
+            if paths.len() == 1 {
+                self.open_path(paths[0].clone());
+            } else {
+                self.convert.open_with(ConvertMode::Merge, paths);
+            }
+            return;
+        }
+        if let Some(p) = paths.iter().find(|p| has_ext(p, &["pdf"])) {
             if self.opened && paths.len() == 1 && ctx.input(|i| i.modifiers.shift) {
                 let at = self.page_count();
                 self.edit(EditOp::InsertPdf { path: p.clone(), at });
             } else {
                 self.open_path(p.clone());
             }
-        } else if paths.iter().all(is_img) {
+        } else if paths.iter().all(|p| has_ext(p, IMAGE_EXTS)) {
             if self.opened {
                 let at = self.page_count();
                 self.edit(EditOp::InsertImages { paths, at });
             } else {
-                self.convert.open = true;
-                self.convert.mode = ConvertMode::ImagesToPdf;
-                self.convert.inputs = paths;
-                self.convert.output = None;
+                self.convert.open_with(ConvertMode::ImagesToPdf, paths);
             }
+        } else {
+            self.set_status("Поддерживаются PDF, документы Office и изображения", true);
+        }
+    }
+
+    /// Следующее (`delta` = 1) или предыдущее (−1) совпадение поиска.
+    fn step_hit(&mut self, delta: i32) {
+        let n = self.hits.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.active_hit {
+            Some(cur) => (cur as i32 + delta).rem_euclid(n as i32) as usize,
+            None => 0,
+        };
+        self.select_hit(next);
+    }
+
+    fn select_hit(&mut self, idx: usize) {
+        let Some(h) = self.hits.get(idx) else { return };
+        let page = h.page;
+        let first = h.rects.first().map(|r| self.hit_center(page, r));
+        self.active_hit = Some(idx);
+        self.search_scroll_to = Some(idx);
+        if let Some((x, y)) = first {
+            self.pending.push(Action::Reveal(page, x, y));
         }
     }
 
@@ -1196,6 +1385,33 @@ impl ViewerApp {
         let _ = self.handle.job_tx.send(Job::Sign(Box::new(job)));
     }
 
+    /// Экспорт открытого документа в формат Office: спросить, куда, и запустить.
+    fn export_to(&mut self, mode: ConvertMode) {
+        let Some(src) = self.path.clone() else { return };
+        if self.dirty || self.untitled.is_some() {
+            self.set_status("Сначала сохраните документ (Ctrl+S) — экспорт берёт файл с диска", true);
+            return;
+        }
+        let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("документ".into());
+        let (name, ext) = match mode {
+            ConvertMode::PdfToWord => ("Документ Word", "docx"),
+            ConvertMode::PdfToExcel => ("Книга Excel", "xlsx"),
+            _ => ("Презентация PowerPoint", "pptx"),
+        };
+        let mut d = rfd::FileDialog::new().add_filter(name, &[ext]).set_file_name(format!("{stem}.{ext}"));
+        if let Some(dir) = src.parent() {
+            d = d.set_directory(dir);
+        }
+        let Some(out) = d.save_file() else { return };
+        let op = match mode {
+            ConvertMode::PdfToWord => ConvertOp::PdfToWord { src, out },
+            ConvertMode::PdfToExcel => ConvertOp::PdfToExcel { src, out },
+            _ => ConvertOp::PdfToPowerPoint { src, out },
+        };
+        self.progress = Some(("Запуск Office…".into(), 0.05));
+        let _ = self.handle.job_tx.send(Job::Convert(op));
+    }
+
     fn export_png(&mut self) {
         let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or("page".into());
         if let Some(path) = rfd::FileDialog::new()
@@ -1241,6 +1457,10 @@ impl ViewerApp {
                 (false, Some((page, x, y))) => match self.tool {
                     Tool::Pen => Some(Drag::Ink { page, points: vec![(x, y)] }),
                     Tool::Select | Tool::Highlight | Tool::Rect | Tool::Sign => Some(Drag::Rect { page, start: (x, y), cur: (x, y) }),
+                    Tool::EditText => match self.text_box_at(page, x, y) {
+                        Some(b) => Some(Drag::Move { page, index: b.index, start: (x, y), cur: (x, y) }),
+                        None => Some(Drag::Pan),
+                    },
                     _ => None,
                 },
                 (false, None) => Some(Drag::Pan),
@@ -1248,7 +1468,7 @@ impl ViewerApp {
         }
         if response.dragged() {
             let drag_page = match &self.drag {
-                Some(Drag::Ink { page, .. }) | Some(Drag::Rect { page, .. }) => Some(*page),
+                Some(Drag::Ink { page, .. }) | Some(Drag::Rect { page, .. }) | Some(Drag::Move { page, .. }) => Some(*page),
                 _ => None,
             };
             let rel = drag_page.zip(pointer).map(|(page, p)| {
@@ -1273,12 +1493,23 @@ impl ViewerApp {
                         *cur = clamped;
                     }
                 }
+                Some(Drag::Move { cur, .. }) => {
+                    if let Some((raw, _)) = rel {
+                        *cur = raw;
+                    }
+                }
                 None => {}
             }
         }
         if response.drag_stopped() {
             if let Some(d) = self.drag.take() {
                 self.finish_drag(d);
+            }
+        }
+        if response.clicked() && self.tool == Tool::EditText {
+            self.commit_text_edit();
+            if let Some((page, x, y)) = pointer.and_then(|p| self.page_at(p)) {
+                self.start_text_edit(page, x, y);
             }
         }
         if response.clicked() && self.tool == Tool::Note {
@@ -1294,6 +1525,12 @@ impl ViewerApp {
         let rgba = Rgba(color.r(), color.g(), color.b(), 255);
         match d {
             Drag::Pan => {}
+            Drag::Move { page, index, start, cur } => {
+                let (dx, dy) = (cur.0 - start.0, cur.1 - start.1);
+                if dx.abs() + dy.abs() > 0.5 {
+                    self.edit(EditOp::MoveObject { page, index, dx, dy });
+                }
+            }
             Drag::Ink { page, points } => {
                 if points.len() >= 2 {
                     self.ghost(page, Mark::Ink(points.clone()));
@@ -1316,7 +1553,8 @@ impl ViewerApp {
                     }
                     Tool::Highlight => {
                         self.ghost(page, Mark::Marker(start, cur));
-                        self.edit(EditOp::Highlight { page, rect, color: Rgba(255, 224, 64, 255) });
+                        let c = self.marker_color;
+                        self.edit(EditOp::Highlight { page, rect, color: Rgba(c.r(), c.g(), c.b(), 255) });
                     }
                     Tool::Rect => {
                         self.ghost(page, Mark::Frame(start, cur));
@@ -1336,7 +1574,8 @@ impl ViewerApp {
     }
 
     fn ghost(&mut self, page: usize, mark: Mark) {
-        self.ghosts.push(Ghost { page, mark, color: self.pen_color, width: self.pen_width, armed: false });
+        let color = if matches!(mark, Mark::Marker(..)) { self.marker_color } else { self.pen_color };
+        self.ghosts.push(Ghost { page, mark, color, width: self.pen_width, armed: false });
     }
 
     // ------------------------------------------------------------------
@@ -1410,13 +1649,12 @@ impl ViewerApp {
         }
     }
 
-    fn draw_overlays(&self, painter: &egui::Painter, canvas: Rect, visible: &[usize]) {
-        // Результаты поиска.
+    fn draw_overlays(&self, painter: &egui::Painter, canvas: Rect, visible: std::ops::Range<usize>) {
+        // Результаты поиска: они упорядочены по страницам — берём только видимые.
         if !self.hits.is_empty() {
-            for (idx, h) in self.hits.iter().enumerate() {
-                if !visible.contains(&h.page) {
-                    continue;
-                }
+            let lo = self.hits.partition_point(|h| h.page < visible.start);
+            let hi = self.hits.partition_point(|h| h.page < visible.end);
+            for (idx, h) in self.hits.iter().enumerate().take(hi).skip(lo) {
                 let base = self.page_screen_rect(h.page).min;
                 let active = self.active_hit == Some(idx);
                 for r in &h.rects {
@@ -1436,6 +1674,37 @@ impl ViewerApp {
                 }
             }
         }
+        // Рамки текстовых объектов в режиме правки.
+        if self.tool == Tool::EditText {
+            let hover = self.cursor_pt.and_then(|(p, x, y)| self.text_box_at(p, x, y).map(|b| (p, b.index)));
+            let editing = self.text_edit.as_ref().and_then(|e| e.index.map(|i| (e.page, i)));
+            for page in visible.clone() {
+                let Some(boxes) = self.text_boxes.get(&page) else { continue };
+                let base = self.page_screen_rect(page).min;
+                for b in boxes {
+                    if editing == Some((page, b.index)) {
+                        continue;
+                    }
+                    let (x0, y0, x1, y1) = self.hit_rect_rotated(page, &b.rect);
+                    let mut rect = Rect::from_min_max(base + Vec2::new(x0, y0) * self.view.zoom, base + Vec2::new(x1, y1) * self.view.zoom).expand(1.5);
+                    if let Some(Drag::Move { page: dp, index, start, cur }) = &self.drag {
+                        if *dp == page && *index == b.index {
+                            rect = rect.translate(Vec2::new(cur.0 - start.0, cur.1 - start.1) * self.view.zoom);
+                        }
+                    }
+                    if !rect.intersects(canvas) {
+                        continue;
+                    }
+                    let a = theme::accent();
+                    if hover == Some((page, b.index)) || matches!(&self.drag, Some(Drag::Move { index, .. }) if *index == b.index) {
+                        painter.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 28));
+                        painter.rect_stroke(rect, 2.0, Stroke::new(1.5, a));
+                    } else {
+                        painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 40)));
+                    }
+                }
+            }
+        }
         // Свежие аннотации, которых ещё нет в тайлах.
         for g in &self.ghosts {
             if visible.contains(&g.page) {
@@ -1450,7 +1719,7 @@ impl ViewerApp {
                     painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(80, 150, 255, 60));
                     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_rgb(80, 150, 255)));
                 }
-                Tool::Highlight => self.draw_mark(painter, *page, &Mark::Marker(*start, *cur), self.pen_color, self.pen_width),
+                Tool::Highlight => self.draw_mark(painter, *page, &Mark::Marker(*start, *cur), self.marker_color, self.pen_width),
                 Tool::Sign => self.draw_sign_frame(painter, *page, *start, *cur),
                 _ => self.draw_mark(painter, *page, &Mark::Frame(*start, *cur), self.pen_color, self.pen_width),
             },
@@ -1492,7 +1761,14 @@ impl ViewerApp {
                 painter.rect_stroke(self.disp_rect_on_screen(page, *a, *b), 0.0, stroke);
             }
             Mark::Marker(a, b) => {
-                painter.rect_filled(self.disp_rect_on_screen(page, *a, *b), 0.0, Color32::from_rgba_unmultiplied(255, 224, 64, 110));
+                painter.rect_filled(self.disp_rect_on_screen(page, *a, *b), 0.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110));
+            }
+            Mark::Text { cover, at, text, size } => {
+                if let Some((x0, y0, x1, y1)) = cover {
+                    painter.rect_filled(self.disp_rect_on_screen(page, (*x0, *y0), (*x1, *y1)).expand(1.0), 0.0, Color32::WHITE);
+                }
+                let pos = self.page_screen_rect(page).min + Vec2::new(at.0, at.1) * self.view.zoom;
+                painter.text(pos, egui::Align2::LEFT_TOP, text, egui::FontId::proportional((size * self.view.zoom).max(1.0)), color);
             }
         }
     }
@@ -1516,6 +1792,12 @@ impl ViewerApp {
             (_, Some(Drag::Pan)) => egui::CursorIcon::Grabbing,
             (Tool::Hand, _) => egui::CursorIcon::Grab,
             (Tool::Select, _) => egui::CursorIcon::Text,
+            (Tool::EditText, Some(Drag::Move { .. })) => egui::CursorIcon::Grabbing,
+            (Tool::EditText, _) => match response.hover_pos().and_then(|p| self.page_at(p)) {
+                Some((page, x, y)) if self.text_box_at(page, x, y).is_some() => egui::CursorIcon::Text,
+                Some(_) => egui::CursorIcon::Crosshair,
+                None => egui::CursorIcon::Default,
+            },
             _ => egui::CursorIcon::Crosshair,
         };
         if response.hovered() {
@@ -1544,18 +1826,18 @@ impl ViewerApp {
         let (lod, lod_scale) = lod_scale_for(zoom * ui.ctx().pixels_per_point(), MIN_LOD, MAX_LOD);
         // Запрашиваем чуть шире экрана — прокрутка не показывает пустоты.
         let prefetch = canvas.expand2(Vec2::new(0.0, canvas.height() * 0.35));
-        let mut visible_pages = Vec::new();
+        let visible_pages = self.pages_in(prefetch.top(), prefetch.bottom());
         let mut per_page = Vec::new();
         let mut protected = HashSet::new();
         let mut drawn = Vec::new();
-        for i in 0..self.layout.rects.len() {
+        let shadow = egui::epaint::Shadow { offset: Vec2::new(0.0, 2.0), blur: 12.0, spread: 0.0, color: theme::shadow() };
+        for i in visible_pages.clone() {
             let r = self.page_screen_rect(i);
             if !r.intersects(prefetch) {
                 continue;
             }
-            visible_pages.push(i);
-            // Подложка и тень страницы.
-            painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)).expand(1.0), 0.0, theme::shadow());
+            // Подложка и мягкая тень страницы.
+            painter.add(shadow.as_shape(r, 0.0));
             painter.rect_filled(r, 0.0, Color32::WHITE);
             let rel = r.min - prefetch.min;
             let tiles: Vec<(u32, u32)> = visible_tiles_center_out(
@@ -1605,7 +1887,144 @@ impl ViewerApp {
             ui.ctx().request_repaint();
         }
         self.view_pending = busy;
-        self.draw_overlays(&painter, canvas, &visible_pages);
+        if self.tool == Tool::EditText {
+            for page in visible_pages.clone() {
+                if self.text_requested.insert(page) {
+                    let _ = self.handle.job_tx.send(Job::TextObjects { gen: self.gen, page });
+                }
+            }
+        } else if self.text_edit.is_some() {
+            self.commit_text_edit();
+        }
+        self.draw_overlays(&painter, canvas, visible_pages);
+        self.text_editor(ui, canvas);
+    }
+
+    // ------------------------------------------------------------------
+    // Правка текста
+
+    /// Текстовый объект под точкой (display pt текущего поворота): самый мелкий из накрывающих.
+    fn text_box_at(&self, page: usize, x: f32, y: f32) -> Option<&TextBox> {
+        self.text_boxes
+            .get(&page)?
+            .iter()
+            .filter(|b| {
+                let (x0, y0, x1, y1) = self.hit_rect_rotated(page, &b.rect);
+                x >= x0 - 1.0 && x <= x1 + 1.0 && y >= y0 - 1.0 && y <= y1 + 1.0
+            })
+            .min_by(|a, b| {
+                let area = |r: &DispRect| (r.x1 - r.x0) * (r.y1 - r.y0);
+                area(&a.rect).total_cmp(&area(&b.rect))
+            })
+    }
+
+    /// Открывает редактор: на объекте под точкой или новый текст в точке.
+    fn start_text_edit(&mut self, page: usize, x: f32, y: f32) {
+        let ed = match self.text_box_at(page, x, y).cloned() {
+            Some(b) => TextEditing {
+                page,
+                index: Some(b.index),
+                original: b.text.clone(),
+                text: b.text.trim_end().to_string(),
+                at: self.hit_rect_rotated(page, &b.rect),
+                size: b.size,
+                color: Color32::from_rgb(b.color.0, b.color.1, b.color.2),
+                id: egui::Id::new(("text_edit", page, b.index, self.gen)),
+                focused: false,
+            },
+            None => TextEditing {
+                page,
+                index: None,
+                original: String::new(),
+                text: String::new(),
+                at: (x, y, x, y + self.text_size * 1.2),
+                size: self.text_size,
+                color: self.text_color,
+                id: egui::Id::new(("text_new", page, x.to_bits(), y.to_bits())),
+                focused: false,
+            },
+        };
+        self.text_edit = Some(ed);
+    }
+
+    /// Применяет правку из открытого редактора (если текст изменился).
+    fn commit_text_edit(&mut self) {
+        let Some(ed) = self.text_edit.take() else { return };
+        let (x0, y0, _, _) = ed.at;
+        let color = Rgba(ed.color.r(), ed.color.g(), ed.color.b(), 255);
+        match ed.index {
+            Some(index) => {
+                if ed.text == ed.original.trim_end() {
+                    return;
+                }
+                self.ghosts.push(Ghost {
+                    page: ed.page,
+                    mark: Mark::Text { cover: Some(ed.at), at: (x0, y0), text: ed.text.clone(), size: ed.size },
+                    color: ed.color,
+                    width: 0.0,
+                    armed: false,
+                });
+                // Хвостовой пробел строки сохраняем: PDFium считает его частью объекта.
+                let tail = &ed.original[ed.original.trim_end().len()..];
+                let text = if ed.text.trim().is_empty() { String::new() } else { format!("{}{tail}", ed.text) };
+                self.edit(EditOp::ReplaceText { page: ed.page, index, expect: ed.original, text });
+            }
+            None => {
+                if ed.text.trim().is_empty() {
+                    return;
+                }
+                self.ghosts.push(Ghost {
+                    page: ed.page,
+                    mark: Mark::Text { cover: None, at: (x0, y0), text: ed.text.clone(), size: ed.size },
+                    color: ed.color,
+                    width: 0.0,
+                    armed: false,
+                });
+                self.edit(EditOp::AddText { page: ed.page, x: x0, y: y0, text: ed.text, size: ed.size, color });
+            }
+        }
+    }
+
+    /// Встроенный редактор поверх страницы: Enter — применить, Esc — отменить.
+    fn text_editor(&mut self, ui: &mut egui::Ui, canvas: Rect) {
+        let zoom = self.view.zoom;
+        let Some(ed) = &self.text_edit else { return };
+        let base = self.page_screen_rect(ed.page).min;
+        let (x0, y0, x1, y1) = ed.at;
+        let orig = Rect::from_min_max(base + Vec2::new(x0, y0) * zoom, base + Vec2::new(x1, y1) * zoom);
+        if !orig.intersects(canvas) {
+            return;
+        }
+        let px = (ed.size * zoom).clamp(6.0, 400.0);
+        let font = egui::FontId::proportional(px);
+        let measured = ui.fonts(|f| f.layout_no_wrap(format!("{}  ", ed.text), font.clone(), Color32::WHITE).size().x);
+        let w = measured.max(orig.width()).max(px * 3.0);
+        let h = (px * 1.25).max(orig.height());
+        let rect = Rect::from_min_size(orig.min, Vec2::new(w, h));
+        // Исходный текст закрываем подложкой — видно только редактируемое.
+        ui.painter().rect_filled(orig.union(rect).expand(2.0), 2.0, Color32::WHITE);
+        let ed = self.text_edit.as_mut().unwrap();
+        let resp = ui.put(
+            rect,
+            egui::TextEdit::singleline(&mut ed.text)
+                .id(ed.id)
+                .font(font)
+                .text_color(ed.color)
+                .frame(false)
+                .margin(egui::Margin::ZERO)
+                .desired_width(w),
+        );
+        ui.painter().rect_stroke(rect.expand(3.0), 3.0, Stroke::new(1.5, theme::accent()));
+        if !ed.focused {
+            ed.focused = true;
+            resp.request_focus();
+        } else if resp.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.text_edit = None;
+            } else {
+                self.commit_text_edit();
+            }
+        }
     }
 
     fn page_menu(&self, ui: &mut egui::Ui, page: usize, ops: &mut Vec<EditOp>) {
@@ -1666,196 +2085,485 @@ impl ViewerApp {
     // Панели
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            if icon_button(ui, ph::FOLDER_OPEN, "Открыть  (Ctrl+O)", false).clicked() {
-                if let Some(p) = pick_pdf() {
-                    self.open_path(p);
-                }
-            }
-            let can = self.opened;
-            ui.add_enabled_ui(can, |ui| {
-                if icon_button(ui, ph::FLOPPY_DISK, "Сохранить  (Ctrl+S)", false).clicked() {
-                    self.save(false);
-                }
-                if icon_button(ui, ph::EXPORT, "Сохранить как…  (Ctrl+Shift+S)", false).clicked() {
-                    self.save(true);
-                }
-                if icon_button(ui, ph::PRINTER, "Печать…  (Ctrl+P)", self.print.open).clicked() {
-                    self.open_print();
-                }
-            });
-            vsep(ui);
-            if icon_button(ui, ph::SIDEBAR, "Боковая панель  (Ctrl+W)", self.show_sidebar).clicked() {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::hover());
+        let compact = rect.width() < 980.0;
+        let zone = |ui: &mut egui::Ui, layout: egui::Layout| ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+        let mut left = zone(ui, egui::Layout::left_to_right(egui::Align::Center));
+        self.toolbar_left(&mut left);
+        let left_end = left.min_rect().right();
+        let mut right = zone(ui, egui::Layout::right_to_left(egui::Align::Center));
+        self.toolbar_right(&mut right, compact);
+        let right_start = right.min_rect().left();
+        if !self.opened {
+            return;
+        }
+        // Навигация и масштаб — по центру окна, если хватает места; ширину берём с прошлого кадра.
+        let id = egui::Id::new("toolbar_center_w");
+        let w = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(360.0);
+        let x = (rect.center().x - w * 0.5).min(right_start - 12.0 - w).max(left_end + 12.0);
+        let crect = Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(rect.right(), rect.bottom()));
+        let mut center = ui.new_child(egui::UiBuilder::new().max_rect(crect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        self.toolbar_center(&mut center, compact);
+        let used = center.min_rect().width();
+        if (used - w).abs() > 0.5 {
+            ui.ctx().data_mut(|d| d.insert_temp(id, used));
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn toolbar_left(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.opened, |ui| {
+            if icon_button(ui, ph::SIDEBAR_SIMPLE, "Панель страниц и поиска  (Ctrl+W)", self.show_sidebar && self.opened).clicked() {
                 self.show_sidebar = !self.show_sidebar;
             }
-            vsep(ui);
+        });
+        vsep(ui);
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if icon_button(ui, ph::FOLDER_OPEN, "Открыть  (Ctrl+O)", false).clicked() {
+            self.open_dialog();
+        }
+        self.recent_menu(ui);
+        ui.add_space(4.0);
+        ui.add_enabled_ui(self.opened, |ui| {
+            let tip = if self.dirty { "Сохранить изменения  (Ctrl+S)" } else { "Сохранить  (Ctrl+S)" };
+            let r = icon_button(ui, ph::FLOPPY_DISK, tip, false);
+            if self.dirty {
+                // Точка на дискете: есть несохранённые правки.
+                ui.painter().circle_filled(r.rect.right_top() + Vec2::new(-7.0, 7.0), 3.5, theme::accent());
+            }
+            if r.clicked() {
+                self.save(false);
+            }
+            if icon_button(ui, ph::PRINTER, "Печать…  (Ctrl+P)", self.print.open).clicked() {
+                self.open_print();
+            }
+        });
+    }
 
-            ui.add_enabled_ui(can, |ui| {
-                // Зум
-                if icon_button(ui, ph::MAGNIFYING_GLASS_MINUS, "Уменьшить  (−)", false).clicked() {
-                    self.pending.push(Action::Zoom(1.0 / ZOOM_STEP));
-                }
-                let zoom_label = format!("{:.0}%", self.view.zoom * 100.0);
+    fn recent_menu(&mut self, ui: &mut egui::Ui) {
+        let recent = self.store.data.recent.clone();
+        let mut open: Option<PathBuf> = None;
+        let mut clear = false;
+        ui.scope(|ui| {
+            theme::flat(ui);
+            ui.spacing_mut().button_padding = Vec2::new(3.0, 4.0);
+            ui.add_enabled_ui(!recent.is_empty(), |ui| {
+                ui.menu_button(egui::RichText::new(ph::CARET_DOWN).size(11.0).color(theme::muted()), |ui| {
+                    ui.set_min_width(300.0);
+                    theme::section_label(ui, "НЕДАВНИЕ ФАЙЛЫ");
+                    for r in &recent {
+                        let name = r.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                        let color = if r.path.exists() { theme::text() } else { theme::muted() };
+                        let text = egui::RichText::new(format!("{}  {name}", ph::FILE_PDF)).color(color);
+                        if ui.button(text).on_hover_text(r.path.display().to_string()).clicked() {
+                            open = Some(r.path.clone());
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(egui::RichText::new("Очистить список").color(theme::muted())).clicked() {
+                        clear = true;
+                        ui.close_menu();
+                    }
+                })
+                .response
+                .on_hover_text("Недавние файлы");
+            });
+        });
+        if clear {
+            self.store.update(|s| s.recent.clear());
+        }
+        if let Some(p) = open {
+            self.open_recent(p);
+        }
+    }
+
+    fn toolbar_center(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let n = self.page_count().max(1);
+        theme::pill_frame().show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if icon_button(ui, ph::CARET_LEFT, "Предыдущая страница  (PageUp)", false).clicked() && self.current_page > 0 {
+                self.pending.push(Action::GotoPage(self.current_page - 1));
+            }
+            self.page_field(ui);
+            ui.label(egui::RichText::new(format!("из {n}")).color(theme::muted()));
+            ui.add_space(2.0);
+            if icon_button(ui, ph::CARET_RIGHT, "Следующая страница  (PageDown)", false).clicked() {
+                self.pending.push(Action::GotoPage(self.current_page + 1));
+            }
+        });
+        ui.add_space(8.0);
+        theme::pill_frame().show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if icon_button(ui, ph::MINUS, "Мельче  (Ctrl −)", false).clicked() {
+                self.pending.push(Action::Zoom(1.0 / ZOOM_STEP));
+            }
+            ui.scope(|ui| {
+                theme::flat(ui);
                 egui::ComboBox::from_id_salt("zoom")
-                    .selected_text(egui::RichText::new(zoom_label).monospace())
-                    .width(78.0)
+                    .selected_text(egui::RichText::new(format!("{:.0}%", self.view.zoom * 100.0)).monospace())
+                    .width(64.0)
                     .show_ui(ui, |ui| {
-                        for z in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0] {
+                        if ui.selectable_label(false, format!("{}  Вся страница", ph::FRAME_CORNERS)).clicked() {
+                            self.pending.push(Action::FitPage);
+                        }
+                        if ui.selectable_label(false, format!("{}  По ширине", ph::ARROWS_OUT_LINE_HORIZONTAL)).clicked() {
+                            self.pending.push(Action::FitWidth);
+                        }
+                        ui.separator();
+                        for z in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
                             if ui.selectable_label(false, format!("{:.0}%", z * 100.0)).clicked() {
                                 self.pending.push(Action::Zoom(z / self.view.zoom));
                             }
                         }
-                        ui.separator();
-                        if ui.selectable_label(false, "Вписать страницу").clicked() {
-                            self.pending.push(Action::FitPage);
-                        }
-                        if ui.selectable_label(false, "По ширине").clicked() {
-                            self.pending.push(Action::FitWidth);
-                        }
-                    });
-                if icon_button(ui, ph::MAGNIFYING_GLASS_PLUS, "Увеличить  (+)", false).clicked() {
-                    self.pending.push(Action::Zoom(ZOOM_STEP));
-                }
-                if icon_button(ui, ph::FRAME_CORNERS, "Вписать страницу  (F)", false).clicked() {
+                    })
+                    .response
+                    .on_hover_text("Масштаб");
+            });
+            if icon_button(ui, ph::PLUS, "Крупнее  (Ctrl +)", false).clicked() {
+                self.pending.push(Action::Zoom(ZOOM_STEP));
+            }
+            if !compact {
+                vsep(ui);
+                if icon_button(ui, ph::FRAME_CORNERS, "Вся страница  (Ctrl 0)", false).clicked() {
                     self.pending.push(Action::FitPage);
                 }
-                if icon_button(ui, ph::ARROWS_OUT_LINE_HORIZONTAL, "По ширине  (W)", false).clicked() {
+                if icon_button(ui, ph::ARROWS_OUT_LINE_HORIZONTAL, "По ширине  (Ctrl 2)", false).clicked() {
                     self.pending.push(Action::FitWidth);
                 }
-                vsep(ui);
-                if icon_button(ui, ph::ARROW_COUNTER_CLOCKWISE, "Повернуть вид влево  ([)", false).clicked() {
+            }
+        });
+    }
+
+    /// Поле номера страницы: в покое показывает текущую, при фокусе выделяет всё.
+    fn page_field(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::new("goto_page");
+        if !ui.memory(|m| m.has_focus(id)) {
+            self.goto_text = (self.current_page + 1).to_string();
+        }
+        let out = egui::TextEdit::singleline(&mut self.goto_text)
+            .id(id)
+            .desired_width(34.0)
+            .horizontal_align(egui::Align::Center)
+            .margin(Vec2::new(4.0, 3.0))
+            .show(ui);
+        if out.response.gained_focus() {
+            let mut st = out.state.clone();
+            let end = self.goto_text.chars().count();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
+            st.store(ui.ctx(), id);
+        }
+        if out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Ok(k) = self.goto_text.trim().parse::<usize>() {
+                self.pending.push(Action::GotoPage(k.saturating_sub(1)));
+            }
+        }
+        out.response.on_hover_text("Номер страницы: введите и нажмите Enter");
+    }
+
+    fn toolbar_right(&mut self, ui: &mut egui::Ui, compact: bool) {
+        self.more_menu(ui);
+        if icon_button(ui, ph::GEAR, "Настройки", self.show_settings).clicked() {
+            self.show_settings = !self.show_settings;
+        }
+        vsep(ui);
+        let text = if compact { ph::SWAP.to_string() } else { format!("{}  Конвертер", ph::SWAP) };
+        let btn = egui::Button::new(text).min_size(Vec2::new(0.0, 28.0)).selected(self.convert.open);
+        if ui.add(btn).on_hover_text("Объединить, разделить, PDF ↔ картинки и текст").clicked() {
+            if self.convert.open {
+                self.convert.open = false;
+            } else if self.convert.inputs.is_empty() {
+                let mode = self.convert.mode;
+                self.convert.open_with(mode, self.path.iter().cloned().collect());
+            } else {
+                self.convert.open = true;
+            }
+        }
+    }
+
+    fn more_menu(&mut self, ui: &mut egui::Ui) {
+        let can = self.opened;
+        ui.scope(|ui| {
+            theme::flat(ui);
+            ui.spacing_mut().button_padding = Vec2::new(7.0, 4.0);
+            ui.menu_button(egui::RichText::new(ph::DOTS_THREE).size(theme::ICON), |ui| {
+                ui.set_min_width(250.0);
+                let item = |icon: &str, text: &str, keys: &str| egui::Button::new(format!("{icon}  {text}")).shortcut_text(keys);
+                if ui.add_enabled(can, item(ph::EXPORT, "Сохранить как…", "Ctrl+Shift+S")).clicked() {
+                    ui.close_menu();
+                    self.save(true);
+                }
+                if ui.add_enabled(can, item(ph::IMAGE, "Страницу в PNG…", "Ctrl+E")).clicked() {
+                    ui.close_menu();
+                    self.export_png();
+                }
+                ui.separator();
+                theme::section_label(ui, "ЭКСПОРТ");
+                for (mode, icon, text) in [
+                    (ConvertMode::PdfToWord, ph::MICROSOFT_WORD_LOGO, "В Word (.docx)…"),
+                    (ConvertMode::PdfToExcel, ph::MICROSOFT_EXCEL_LOGO, "В Excel (.xlsx)…"),
+                    (ConvertMode::PdfToPowerPoint, ph::MICROSOFT_POWERPOINT_LOGO, "В PowerPoint (.pptx)…"),
+                ] {
+                    if ui.add_enabled(can, item(icon, text, "")).clicked() {
+                        ui.close_menu();
+                        self.export_to(mode);
+                    }
+                }
+                ui.separator();
+                if ui.add_enabled(can, item(ph::ARROW_COUNTER_CLOCKWISE, "Повернуть вид влево", "[")).clicked() {
                     self.rotate_view(-1);
+                    ui.close_menu();
                 }
-                if icon_button(ui, ph::ARROW_CLOCKWISE, "Повернуть вид вправо  (])", false).clicked() {
+                if ui.add_enabled(can, item(ph::ARROW_CLOCKWISE, "Повернуть вид вправо", "]")).clicked() {
                     self.rotate_view(1);
+                    ui.close_menu();
                 }
-                vsep(ui);
+                ui.separator();
+                if ui.add(item(ph::KEYBOARD, "Горячие клавиши", "F1")).clicked() {
+                    self.show_help = true;
+                    ui.close_menu();
+                }
+                if ui.add(item(ph::GEAR, "Настройки", "")).clicked() {
+                    self.show_settings = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new(format!("PDFsmith {}", crate::updates::CURRENT_VERSION)).small().color(theme::muted()));
+            })
+            .response
+            .on_hover_text("Ещё");
+        });
+    }
 
-                // Инструменты
-                let tools = [
-                    (Tool::Hand, ph::HAND, "Рука: перетаскивание  (H)"),
-                    (Tool::Select, ph::CURSOR_TEXT, "Выделить текст → копировать  (T)"),
-                    (Tool::Pen, ph::PEN, "Карандаш  (P)"),
-                    (Tool::Highlight, ph::HIGHLIGHTER, "Маркер  (M)"),
-                    (Tool::Rect, ph::RECTANGLE, "Рамка  (R)"),
-                    (Tool::Note, ph::CHAT_TEXT, "Заметка  (N)"),
-                    (Tool::Sign, ph::SEAL_CHECK, "Подписать ЭП (КриптоПро): обведите место подписи  (G)"),
-                ];
-                for (t, icon, tip) in tools {
-                    if icon_button(ui, icon, tip, self.tool == t).clicked() {
-                        self.tool = t;
-                    }
+    /// Лента инструментов слева от холста.
+    fn tool_rail(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (i, (t, icon, label, tip)) in TOOLS.into_iter().enumerate() {
+                if i == 2 || i == 6 {
+                    ui.add_space(3.0);
+                    ui.separator();
+                    ui.add_space(3.0);
                 }
-                if matches!(self.tool, Tool::Pen | Tool::Rect) {
-                    let mut c = [self.pen_color.r(), self.pen_color.g(), self.pen_color.b()];
-                    if ui.color_edit_button_srgb(&mut c).on_hover_text("Цвет").changed() {
-                        self.pen_color = Color32::from_rgb(c[0], c[1], c[2]);
-                    }
-                    ui.add(egui::Slider::new(&mut self.pen_width, 0.5..=12.0).show_value(false).fixed_decimals(1))
-                        .on_hover_text(format!("Толщина: {:.1} pt", self.pen_width));
+                if rail_button(ui, icon, label, tip, self.tool == t).clicked() {
+                    // Повторный щелчок по инструменту возвращает к руке.
+                    self.tool = if self.tool == t { Tool::Hand } else { t };
+                    self.drag = None;
                 }
-                if icon_button(ui, ph::ARROW_U_UP_LEFT, "Отменить последнюю аннотацию  (Ctrl+Z)", false).clicked() {
-                    self.edit(EditOp::UndoAnnotation(self.current_page));
-                }
-                vsep(ui);
-            });
+            }
+            ui.add_space(3.0);
+            ui.separator();
+            ui.add_space(3.0);
+            if rail_button(ui, ph::ARROW_U_UP_LEFT, "Отменить", "Отменить последнюю правку  (Ctrl+Z)", false).clicked() {
+                self.edit(EditOp::Undo { page: self.current_page });
+            }
+        });
+    }
 
-            // Правая часть.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(2.0);
-                if icon_button(ui, ph::INFO, "Горячие клавиши  (F1)", self.show_help).clicked() {
-                    self.show_help = !self.show_help;
-                }
-                if icon_button(ui, ph::GEAR, "Настройки", self.show_settings).clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-                if ui
-                    .add(egui::Button::new(egui::RichText::new(format!("{}  Конвертер", ph::SWAP))).min_size(Vec2::new(0.0, 26.0)))
-                    .on_hover_text("PDF ↔ изображения, текст; объединение и разделение")
-                    .clicked()
-                {
-                    self.convert.open = !self.convert.open;
-                    if self.convert.inputs.is_empty() {
-                        if let Some(p) = &self.path {
-                            self.convert.inputs = vec![p.clone()];
-                        }
-                    }
-                }
-                ui.add_enabled_ui(can, |ui| {
-                    if icon_button(ui, ph::IMAGE, "Экспорт страницы в PNG  (Ctrl+E)", false).clicked() {
-                        self.export_png();
-                    }
-                    vsep(ui);
-                    // Навигация по страницам
-                    let n = self.page_count().max(1);
-                    if icon_button(ui, ph::CARET_RIGHT, "Следующая страница  (PageDown)", false).clicked() {
-                        self.pending.push(Action::GotoPage(self.current_page + 1));
-                    }
-                    ui.label(egui::RichText::new(format!("/ {n}")).color(theme::muted()));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.goto_text)
-                            .desired_width(34.0)
-                            .horizontal_align(egui::Align::Center)
-                            .hint_text(format!("{}", self.current_page + 1)),
-                    );
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if let Ok(k) = self.goto_text.trim().parse::<usize>() {
-                            if k >= 1 {
-                                self.pending.push(Action::GotoPage(k - 1));
+    /// Подсказка и настройки активного инструмента — плашка вверху холста.
+    fn tool_hint(&mut self, ctx: &egui::Context) {
+        if !self.opened || self.tool == Tool::Hand || !self.central.is_positive() {
+            return;
+        }
+        let (name, hint) = match self.tool {
+            Tool::Select => ("Текст", "Обведите текст — он скопируется в буфер обмена"),
+            Tool::Highlight => ("Маркер", "Обведите строки, которые нужно выделить"),
+            Tool::Pen => ("Перо", "Рисуйте, удерживая левую кнопку мыши"),
+            Tool::Rect => ("Рамка", "Растяните рамку на странице"),
+            Tool::Note => ("Заметка", "Щёлкните там, где нужна заметка"),
+            Tool::Sign => ("Подпись", "Обведите место для штампа подписи"),
+            Tool::EditText => ("Правка", "Щёлкните по тексту — изменить, на пустом месте — добавить, тяните — переместить"),
+            Tool::Hand => return,
+        };
+        let icon = TOOLS.iter().find(|t| t.0 == self.tool).map(|t| t.1).unwrap_or(ph::HAND);
+        egui::Area::new(egui::Id::new("tool_hint"))
+            .order(egui::Order::Foreground)
+            .movable(false)
+            // Размер на первый (замерочный) кадр: иначе невидимая область по умолчанию
+            // 600×400 на кадр перекроет холст и перехватит нажатие.
+            .default_size(Vec2::new(760.0, 44.0))
+            .pivot(egui::Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(self.central.center().x, self.central.top() + 10.0))
+            .show(ctx, |ui| {
+                theme::float_frame().rounding(20.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(icon).size(16.0).color(theme::accent()));
+                        ui.label(egui::RichText::new(name).strong());
+                        ui.label(egui::RichText::new(hint).color(theme::muted()));
+                        match self.tool {
+                            Tool::Pen | Tool::Rect => {
+                                vsep(ui);
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (c, n) in PEN_COLORS {
+                                    if theme::swatch(ui, c, self.pen_color == c, n).clicked() {
+                                        self.pen_color = c;
+                                    }
+                                }
+                                let mut rgb = [self.pen_color.r(), self.pen_color.g(), self.pen_color.b()];
+                                ui.spacing_mut().interact_size = Vec2::new(22.0, 18.0);
+                                if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Свой цвет").changed() {
+                                    self.pen_color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                }
+                                ui.add_space(6.0);
+                                ui.spacing_mut().slider_width = 70.0;
+                                ui.add(egui::Slider::new(&mut self.pen_width, 0.5..=12.0).show_value(false))
+                                    .on_hover_text("Толщина линии");
+                                ui.label(egui::RichText::new(format!("{:.1} pt", self.pen_width)).small().color(theme::muted()));
                             }
+                            Tool::EditText => {
+                                vsep(ui);
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (c, n) in [(Color32::BLACK, "Чёрный")].into_iter().chain(PEN_COLORS) {
+                                    if theme::swatch(ui, c, self.text_color == c, n).on_hover_text("Цвет нового текста").clicked() {
+                                        self.text_color = c;
+                                    }
+                                }
+                                ui.add_space(6.0);
+                                ui.add(egui::DragValue::new(&mut self.text_size).range(4.0..=96.0).speed(0.2).suffix(" pt"))
+                                    .on_hover_text("Кегль нового текста");
+                            }
+                            Tool::Highlight => {
+                                vsep(ui);
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (c, n) in MARKER_COLORS {
+                                    if theme::swatch(ui, c, self.marker_color == c, n).clicked() {
+                                        self.marker_color = c;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        self.goto_text.clear();
-                    }
-                    if icon_button(ui, ph::CARET_LEFT, "Предыдущая страница  (PageUp)", false).clicked() {
-                        if self.current_page > 0 {
-                            self.pending.push(Action::GotoPage(self.current_page - 1));
+                        vsep(ui);
+                        if ui.button("Готово").on_hover_text("Вернуться к руке  (Esc)").clicked() {
+                            self.tool = Tool::Hand;
                         }
-                    }
+                    });
                 });
             });
+    }
+
+    /// Всплывающее уведомление внизу холста: итог операции или ошибка.
+    fn toast(&mut self, ctx: &egui::Context) {
+        let Some((msg, at, err)) = self.status.clone() else { return };
+        let life = if err { 7.0 } else { 3.5 };
+        let t = at.elapsed().as_secs_f32();
+        if t > life {
+            return;
+        }
+        let area = if self.central.is_positive() { self.central } else { ctx.screen_rect() };
+        let fade = ((life - t) / 0.35).clamp(0.0, 1.0);
+        egui::Area::new(egui::Id::new("toast"))
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .interactable(false)
+            .default_size(Vec2::new(360.0, 36.0))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(Pos2::new(area.center().x, area.bottom() - 18.0))
+            .show(ctx, |ui| {
+                ui.multiply_opacity(fade);
+                theme::float_frame().rounding(20.0).show(ui, |ui| {
+                    ui.set_max_width((area.width() - 80.0).clamp(200.0, 620.0));
+                    ui.horizontal(|ui| {
+                        let (icon, color) = if err {
+                            (ph::WARNING_CIRCLE, theme::danger())
+                        } else if msg.ends_with('…') {
+                            (ph::HOURGLASS, theme::muted())
+                        } else {
+                            (ph::CHECK_CIRCLE, theme::ok())
+                        };
+                        ui.label(egui::RichText::new(icon).size(16.0).color(color));
+                        ui.add(egui::Label::new(msg.as_str()).truncate());
+                    });
+                });
+            });
+        if fade < 1.0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32((life - 0.35 - t).max(0.02)));
+        }
+    }
+
+    /// Затемнение с подсказкой, пока над окном тащат файлы.
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        let (any, files, shift) = ctx.input(|i| {
+            let files: Vec<PathBuf> = i.raw.hovered_files.iter().filter_map(|f| f.path.clone()).collect();
+            (!i.raw.hovered_files.is_empty(), files, i.modifiers.shift)
         });
+        if !any {
+            return;
+        }
+        let pdfs = files.iter().filter(|p| has_ext(p, &["pdf"])).count();
+        let imgs = files.iter().filter(|p| has_ext(p, IMAGE_EXTS)).count();
+        let offices = files.iter().filter(|p| office::app_for(p).is_some()).count();
+        let (title, sub): (String, &str) = if self.convert.open {
+            (format!("Добавить в «{}»", self.convert.mode.label()), "подходящие файлы попадут в список конвертера")
+        } else if offices > 0 && files.len() == 1 {
+            ("Открыть как PDF".into(), "документ сконвертирует установленный Microsoft Office")
+        } else if offices > 0 {
+            ("Объединить в один PDF".into(), "откроется конвертер со всеми файлами")
+        } else if pdfs > 0 {
+            if self.opened && shift && files.len() == 1 {
+                ("Добавить страницы в конец".into(), "PDF будет вставлен после последней страницы")
+            } else if self.opened {
+                ("Открыть PDF".into(), "с Shift — добавить его страницы в конец текущего документа")
+            } else {
+                ("Открыть PDF".into(), "")
+            }
+        } else if imgs > 0 && imgs == files.len() {
+            if self.opened {
+                ("Вставить изображения".into(), "каждое станет новой страницей в конце документа")
+            } else {
+                ("Собрать PDF из изображений".into(), "откроется конвертер")
+            }
+        } else if files.is_empty() {
+            ("Отпустите файл".into(), "")
+        } else {
+            ("Такие файлы не поддерживаются".into(), "перетащите PDF или изображения")
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
+        let screen = ctx.screen_rect();
+        painter.rect_filled(screen, 0.0, Color32::from_black_alpha(if theme::is_dark() { 150 } else { 110 }));
+        let r = screen.shrink(18.0);
+        painter.rect_stroke(r, 16.0, Stroke::new(2.0, theme::accent()));
+        let c = r.center();
+        painter.text(c - Vec2::new(0.0, 40.0), egui::Align2::CENTER_CENTER, ph::FILE_ARROW_UP, egui::FontId::proportional(48.0), theme::accent());
+        painter.text(c + Vec2::new(0.0, 14.0), egui::Align2::CENTER_CENTER, title, egui::FontId::proportional(22.0), Color32::WHITE);
+        if !sub.is_empty() {
+            painter.text(c + Vec2::new(0.0, 44.0), egui::Align2::CENTER_CENTER, sub, egui::FontId::proportional(14.0), Color32::from_gray(215));
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             let muted = |s: String| egui::RichText::new(s).color(theme::muted()).small();
-            match &self.path {
-                Some(p) => {
+            match (self.untitled.as_ref().or(self.path.as_ref()), self.opened) {
+                (Some(p), true) => {
                     let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    ui.label(egui::RichText::new(ph::FILE_PDF).color(theme::muted()));
                     ui.label(egui::RichText::new(name).small()).on_hover_text(p.display().to_string());
                     if self.dirty {
-                        ui.label(egui::RichText::new("изменён").color(theme::accent()).small());
+                        ui.label(egui::RichText::new("● не сохранён").color(theme::accent()).small())
+                            .on_hover_text("Есть несохранённые изменения — Ctrl+S");
                     }
                 }
-                None => {
-                    ui.label(muted("Файл не открыт".into()));
-                }
-            }
-            if self.opened {
-                ui.label(muted("·".into()));
-                ui.label(muted(format!("стр. {} из {}", self.current_page + 1, self.page_count())));
-                let (pw, ph_) = self.page_pt(self.current_page);
-                ui.label(muted("·".into()));
-                ui.label(muted(format!("{:.0}×{:.0} мм", pw / 72.0 * 25.4, ph_ / 72.0 * 25.4)));
-                if let Some((page, x, y)) = self.cursor_pt {
-                    ui.label(muted("·".into()));
-                    ui.label(muted(format!("[{}] {:.1}, {:.1} мм", page + 1, x / 72.0 * 25.4, y / 72.0 * 25.4)));
+                _ => {
+                    ui.label(muted("Готов к работе".into()));
                 }
             }
             if self.loading_page {
-                ui.label(muted("·".into()));
+                ui.add_space(8.0);
                 ui.add(egui::Spinner::new().size(12.0));
                 ui.label(muted("Разбор страницы…".into()));
             }
             if let Some(text) = self.upd.status_text(&self.store) {
-                ui.label(muted("·".into()));
+                ui.add_space(8.0);
                 ui.label(muted(text));
             }
             if let Some((msg, frac)) = &self.progress {
-                ui.label(muted("·".into()));
-                ui.add(egui::ProgressBar::new(*frac).desired_width(140.0).desired_height(8.0));
+                ui.add_space(8.0);
+                ui.add(egui::ProgressBar::new(*frac).desired_width(140.0).desired_height(6.0));
                 ui.label(muted(msg.clone()));
             }
             if let Some(cancel) = &self.print_cancel {
@@ -1865,107 +2573,121 @@ impl ViewerApp {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(6.0);
-                if let Some((msg, at, err)) = &self.status {
-                    if at.elapsed().as_secs_f32() < 8.0 {
-                        let color = if *err { theme::danger() } else { theme::ok() };
-                        ui.label(egui::RichText::new(msg).color(color).small());
-                        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            if self.opened {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    let (pw, ph_) = self.page_pt(self.current_page);
+                    ui.label(muted(format!("{:.0} × {:.0} мм", pw / 72.0 * 25.4, ph_ / 72.0 * 25.4)))
+                        .on_hover_text("Размер текущей страницы");
+                    if let Some((page, x, y)) = self.cursor_pt {
+                        ui.label(muted("·".into()));
+                        ui.label(muted(format!("стр. {}: {:.0}, {:.0} мм", page + 1, x / 72.0 * 25.4, y / 72.0 * 25.4)))
+                            .on_hover_text("Положение курсора от левого верхнего угла страницы");
                     }
-                }
-            });
+                });
+            }
         });
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            for (tab, label) in [(SideTab::Pages, "Страницы"), (SideTab::Search, "Поиск")] {
-                let active = self.side_tab == tab;
-                let text = egui::RichText::new(label).color(if active { theme::text() } else { theme::muted() });
-                let r = ui.add(egui::Button::new(text).frame(false));
-                if r.clicked() {
-                    self.side_tab = tab;
+            ui.add_space(8.0);
+            theme::pill_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let w = (SIDEBAR_W - 16.0 - 4.0 - 2.0) / 2.0;
+                for (tab, icon, label) in [(SideTab::Pages, ph::SQUARES_FOUR, "Страницы"), (SideTab::Search, ph::MAGNIFYING_GLASS, "Поиск")] {
+                    let active = self.side_tab == tab;
+                    let text = egui::RichText::new(format!("{icon}  {label}")).color(if active { theme::text() } else { theme::muted() });
+                    let fill = if active { theme::seg_active() } else { Color32::TRANSPARENT };
+                    let b = egui::Button::new(text).min_size(Vec2::new(w, 26.0)).fill(fill).stroke(Stroke::NONE);
+                    if ui.add(b).clicked() {
+                        self.side_tab = tab;
+                        if tab == SideTab::Search {
+                            ui.memory_mut(|m| m.request_focus(egui::Id::new("search_field")));
+                        }
+                    }
                 }
-                if active {
-                    let rr = r.rect;
-                    ui.painter().line_segment(
-                        [Pos2::new(rr.left(), rr.bottom() + 3.0), Pos2::new(rr.right(), rr.bottom() + 3.0)],
-                        Stroke::new(2.0, theme::accent()),
-                    );
-                }
-            }
+            });
         });
         ui.add_space(6.0);
-        ui.separator();
         match self.side_tab {
             SideTab::Pages => self.pages_panel(ui),
             SideTab::Search => self.search_panel(ui),
         }
     }
 
+    /// Миниатюры страниц. Рисуются только видимые карточки — длинные документы
+    /// не нагружают кадр.
     fn pages_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.opened {
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Нет открытого документа").color(theme::muted()));
-            return;
-        }
         let n = self.page_count();
-        let thumb_w = SIDEBAR_W - 44.0;
-        let mut goto: Option<usize> = None;
-        let mut ops: Vec<EditOp> = Vec::new();
-        let mut want_thumbs: Vec<usize> = Vec::new();
         // Автопрокрутка списка к текущей странице, когда она сменилась.
         let scroll_sidebar = self.sidebar_page != Some(self.current_page);
         self.sidebar_page = Some(self.current_page);
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(6.0);
-            for i in 0..n {
-                let (pw, ph_) = self.page_pt(i);
-                let th = (thumb_w * ph_ / pw.max(1.0)).clamp(30.0, 400.0);
-                let card_h = th + 26.0;
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(SIDEBAR_W - 20.0, card_h), egui::Sense::click());
+        let card_w = SIDEBAR_W - 24.0;
+        let thumb_w = card_w - 44.0;
+        let thumb_h = |i: usize| {
+            let (pw, ph_) = self.page_pt(i);
+            (thumb_w * ph_ / pw.max(1.0)).clamp(30.0, 400.0)
+        };
+        let mut tops = Vec::with_capacity(n);
+        let mut bottoms = Vec::with_capacity(n);
+        let mut y = 4.0;
+        for i in 0..n {
+            tops.push(y);
+            y += thumb_h(i) + 30.0;
+            bottoms.push(y);
+            y += 4.0;
+        }
+        let total = y + 8.0;
+        let mut goto: Option<usize> = None;
+        let mut ops: Vec<EditOp> = Vec::new();
+        let mut want_thumbs: Vec<usize> = Vec::new();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
+            ui.set_height(total);
+            let origin = ui.max_rect().min + Vec2::new(((ui.max_rect().width() - card_w) * 0.5).max(0.0), 0.0);
+            let card = |i: usize| Rect::from_min_max(origin + Vec2::new(0.0, tops[i]), origin + Vec2::new(card_w, bottoms[i]));
+            let first = bottoms.partition_point(|&b| b < vp.min.y);
+            let last = tops.partition_point(|&t| t <= vp.max.y);
+            for i in first..last.max(first) {
+                let rect = card(i);
+                let resp = ui.interact(rect, ui.id().with(("thumb", i)), egui::Sense::click());
                 let is_cur = i == self.current_page;
-                let visible = ui.clip_rect().intersects(rect);
-                if visible {
-                    let p = ui.painter();
-                    if is_cur {
-                        p.rect_filled(rect, 6.0, theme::accent_wash());
-                    } else if resp.hovered() {
-                        p.rect_filled(rect, 6.0, theme::hover_wash());
-                    }
-                    let img_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 6.0), Vec2::new(thumb_w, th));
-                    p.rect_filled(img_rect.translate(Vec2::new(0.0, 1.5)), 0.0, theme::shadow());
-                    p.rect_filled(img_rect, 0.0, Color32::WHITE);
-                    if let Some(tex) = self.thumbs.get(&(i, self.rotation)) {
-                        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-                        p.image(tex.id(), img_rect, uv, Color32::WHITE);
-                    } else {
-                        want_thumbs.push(i);
-                    }
-                    if is_cur {
-                        p.rect_stroke(img_rect.expand(1.5), 0.0, Stroke::new(2.0, theme::accent()));
-                    }
-                    p.text(
-                        Pos2::new(rect.center().x, img_rect.bottom() + 10.0),
-                        egui::Align2::CENTER_CENTER,
-                        format!("{}", i + 1),
-                        egui::FontId::proportional(11.5),
-                        if is_cur { theme::text() } else { theme::muted() },
-                    );
+                let p = ui.painter();
+                if is_cur {
+                    p.rect_filled(rect, 8.0, theme::accent_wash());
+                } else if resp.hovered() {
+                    p.rect_filled(rect, 8.0, theme::hover_wash());
                 }
+                let th = thumb_h(i);
+                let img_rect = Rect::from_min_size(rect.min + Vec2::new((card_w - thumb_w) * 0.5, 8.0), Vec2::new(thumb_w, th));
+                let shadow = egui::epaint::Shadow { offset: Vec2::new(0.0, 1.0), blur: 6.0, spread: 0.0, color: theme::shadow() };
+                p.add(shadow.as_shape(img_rect, 0.0));
+                p.rect_filled(img_rect, 0.0, Color32::WHITE);
+                if let Some(tex) = self.thumbs.get(&(i, self.rotation)) {
+                    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                    p.image(tex.id(), img_rect, uv, Color32::WHITE);
+                } else {
+                    want_thumbs.push(i);
+                }
+                if is_cur {
+                    p.rect_stroke(img_rect.expand(2.0), 2.0, Stroke::new(2.0, theme::accent()));
+                }
+                p.text(
+                    Pos2::new(rect.center().x, img_rect.bottom() + 11.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", i + 1),
+                    egui::FontId::proportional(11.5),
+                    if is_cur { theme::accent() } else { theme::muted() },
+                );
                 if resp.clicked() {
                     goto = Some(i);
                 }
                 resp.context_menu(|ui| self.page_menu(ui, i, &mut ops));
-                if is_cur && scroll_sidebar {
-                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                }
             }
-            ui.add_space(6.0);
+            if scroll_sidebar && self.current_page < n {
+                ui.scroll_to_rect(card(self.current_page), None);
+            }
         });
         if let Some(p) = goto {
             self.pending.push(Action::GotoPage(p));
@@ -1976,6 +2698,8 @@ impl ViewerApp {
         if self.view_pending {
             want_thumbs.clear();
         }
+        // Сначала текущая и соседние — их видно первыми.
+        want_thumbs.sort_by_key(|&i| (i as i64 - self.current_page as i64).abs());
         for i in want_thumbs {
             if self.thumb_inflight >= THUMB_INFLIGHT {
                 break;
@@ -1989,237 +2713,138 @@ impl ViewerApp {
     }
 
     fn search_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.search_text)
                     .id(egui::Id::new("search_field"))
-                    .desired_width(SIDEBAR_W - 70.0)
-                    .hint_text("Найти в документе…"),
+                    .desired_width(SIDEBAR_W - 8.0 - 4.0 - 30.0 - 12.0 - 12.0)
+                    .margin(Vec2::new(6.0, 5.0))
+                    .hint_text("Найти в документе"),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.start_search();
+                // Повторный Enter по тому же запросу — к следующему совпадению.
+                if !self.hits.is_empty() && self.search_text.trim() == self.search_query {
+                    let back = ui.input(|i| i.modifiers.shift);
+                    self.step_hit(if back { -1 } else { 1 });
+                } else {
+                    self.start_search();
+                }
+                resp.request_focus();
             }
-            if icon_button(ui, ph::MAGNIFYING_GLASS, "Искать  (Enter)", false).clicked() {
-                self.start_search();
+            if self.search_text.is_empty() {
+                if icon_button(ui, ph::MAGNIFYING_GLASS, "Искать  (Enter)", false).clicked() {
+                    self.start_search();
+                }
+            } else if icon_button(ui, ph::X, "Очистить поиск", false).clicked() {
+                self.search_text.clear();
+                self.search_query.clear();
+                self.hits.clear();
+                self.active_hit = None;
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         if self.searching {
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.label(egui::RichText::new("Поиск…").color(theme::muted()).small());
+                ui.label(egui::RichText::new("Ищу…").color(theme::muted()).small());
             });
             return;
         }
-        if !self.search_query.is_empty() {
+        if self.search_query.is_empty() {
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!("«{}»: {}", self.search_query, self.hits.len()))
-                        .color(theme::muted())
-                        .small(),
-                );
-                if !self.hits.is_empty() {
-                    ui.label(egui::RichText::new("F3 — далее").color(theme::muted()).small());
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(SIDEBAR_W - 24.0);
+                    ui.label(
+                        egui::RichText::new("Введите слово и нажмите Enter. Следующее совпадение — Enter или F3, предыдущее — Shift+F3.")
+                            .color(theme::muted())
+                            .small(),
+                    );
+                });
+            });
+            return;
+        }
+        let n = self.hits.len();
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            let label = match (n, self.active_hit) {
+                (0, _) => "Ничего не найдено".to_string(),
+                (n, Some(a)) => format!("{} из {n}", a + 1),
+                (n, None) => format!("Найдено: {n}"),
+            };
+            ui.label(egui::RichText::new(label).color(theme::muted()).small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_enabled_ui(n > 0, |ui| {
+                    if icon_button(ui, ph::CARET_DOWN, "Следующее  (Enter, F3)", false).clicked() {
+                        self.step_hit(1);
+                    }
+                    if icon_button(ui, ph::CARET_UP, "Предыдущее  (Shift+F3)", false).clicked() {
+                        self.step_hit(-1);
+                    }
+                });
+            });
+        });
+        ui.add_space(2.0);
+        if n == 0 {
+            return;
+        }
+        let mut pick: Option<usize> = None;
+        let mut area = egui::ScrollArea::vertical().id_salt("hits").auto_shrink([false, false]);
+        let row_step = HIT_ROW_H + 2.0;
+        if let Some(i) = self.search_scroll_to.take() {
+            // Прокручиваем, только если строка не видна.
+            let st = egui::scroll_area::State::load(ui.ctx(), ui.make_persistent_id("hits"));
+            let off = st.map(|s| s.offset.y).unwrap_or(0.0);
+            let view_h = ui.available_height();
+            let y = i as f32 * row_step;
+            if y < off || y + row_step > off + view_h {
+                area = area.vertical_scroll_offset((y - view_h * 0.35).max(0.0));
+            }
+        }
+        let query = self.search_query.to_lowercase();
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            area.show_rows(ui, HIT_ROW_H, n, |ui, range| {
+                for idx in range {
+                    let h = &self.hits[idx];
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(SIDEBAR_W - 20.0, HIT_ROW_H), egui::Sense::click());
+                    let rect = rect.translate(Vec2::new(4.0, 0.0));
+                    let active = self.active_hit == Some(idx);
+                    let p = ui.painter();
+                    if active {
+                        p.rect_filled(rect, 6.0, theme::accent_wash());
+                    } else if resp.hovered() {
+                        p.rect_filled(rect, 6.0, theme::hover_wash());
+                    }
+                    p.text(
+                        rect.left_top() + Vec2::new(28.0, 6.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{}", h.page + 1),
+                        egui::FontId::monospace(11.5),
+                        if active { theme::accent() } else { theme::muted() },
+                    );
+                    let job = snippet_job(&h.snippet, &query, rect.width() - 42.0, active);
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    p.galley(rect.left_top() + Vec2::new(36.0, 5.0), galley, theme::text());
+                    if resp.on_hover_text(format!("Страница {}", h.page + 1)).clicked() {
+                        pick = Some(idx);
+                    }
                 }
             });
-        }
-        let mut reveal: Option<usize> = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut last_page = usize::MAX;
-            for (idx, h) in self.hits.iter().enumerate() {
-                if h.page != last_page {
-                    last_page = h.page;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(format!("Страница {}", h.page + 1)).color(theme::accent()).small());
-                    });
-                }
-                let active = self.active_hit == Some(idx);
-                let text = egui::RichText::new(&h.snippet).size(12.0).color(if active { theme::text() } else { theme::muted() });
-                let r = ui.add_sized(
-                    Vec2::new(SIDEBAR_W - 16.0, 0.0),
-                    egui::Button::new(text).frame(false).wrap(),
-                );
-                if active {
-                    ui.painter().rect_filled(r.rect, 5.0, theme::accent_wash());
-                }
-                if r.clicked() {
-                    reveal = Some(idx);
-                }
-            }
         });
-        if let Some(idx) = reveal {
-            self.active_hit = Some(idx);
-            let h = &self.hits[idx];
-            if let Some(r) = h.rects.first() {
-                let (x, y) = self.hit_center(h.page, r);
-                self.pending.push(Action::Reveal(h.page, x, y));
-            }
+        if let Some(idx) = pick {
+            self.select_hit(idx);
+            self.search_scroll_to = None;
         }
     }
 
     fn convert_window(&mut self, ctx: &egui::Context) {
-        if !self.convert.open {
-            return;
-        }
-        let mut open = true;
-        let mut run: Option<ConvertOp> = None;
-        egui::Window::new("Конвертер")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(460.0)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let c = &mut self.convert;
-                ui.horizontal(|ui| {
-                    ui.label("Операция");
-                    egui::ComboBox::from_id_salt("convert_mode")
-                        .selected_text(c.mode.label())
-                        .width(320.0)
-                        .show_ui(ui, |ui| {
-                            for m in ConvertMode::ALL {
-                                if ui.selectable_value(&mut c.mode, m, m.label()).changed() {
-                                    c.inputs.clear();
-                                    c.output = None;
-                                }
-                            }
-                        });
-                });
-                ui.add_space(8.0);
-
-                // Входные файлы
-                ui.horizontal(|ui| {
-                    let (name, exts) = c.mode.input_filter();
-                    let label = if c.mode.multi_input() { "Выбрать файлы…" } else { "Выбрать файл…" };
-                    if ui.button(format!("{}  {label}", ph::FOLDER_OPEN)).clicked() {
-                        let d = rfd::FileDialog::new().add_filter(name, exts);
-                        if c.mode.multi_input() {
-                            if let Some(p) = d.pick_files() {
-                                c.inputs = p;
-                            }
-                        } else if let Some(p) = d.pick_file() {
-                            c.inputs = vec![p];
-                        }
-                    }
-                    if c.mode.multi_input() && !c.inputs.is_empty() && ui.button("Очистить").clicked() {
-                        c.inputs.clear();
-                    }
-                });
-                egui::Frame::none().fill(theme::bg()).rounding(3.0).inner_margin(8.0).show(ui, |ui| {
-                    ui.set_min_height(60.0);
-                    ui.set_width(430.0);
-                    if c.inputs.is_empty() {
-                        ui.label(egui::RichText::new("Файлы не выбраны (можно перетащить в окно)").color(theme::muted()).small());
-                    } else {
-                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                            let mut remove = None;
-                            for (i, p) in c.inputs.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    if c.mode.multi_input() {
-                                        if ui.small_button(ph::X).clicked() {
-                                            remove = Some(i);
-                                        }
-                                        if i > 0 && ui.small_button(ph::ARROW_UP).clicked() {
-                                            remove = Some(usize::MAX - i);
-                                        }
-                                    }
-                                    ui.label(egui::RichText::new(p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()).small())
-                                        .on_hover_text(p.display().to_string());
-                                });
-                            }
-                            if let Some(r) = remove {
-                                if r < c.inputs.len() {
-                                    c.inputs.remove(r);
-                                } else {
-                                    let i = usize::MAX - r;
-                                    c.inputs.swap(i, i - 1);
-                                }
-                            }
-                        });
-                    }
-                });
-                ui.add_space(8.0);
-
-                // Параметры
-                if c.mode == ConvertMode::PdfToImages {
-                    ui.horizontal(|ui| {
-                        ui.label("Формат");
-                        ui.selectable_value(&mut c.jpeg, false, "PNG");
-                        ui.selectable_value(&mut c.jpeg, true, "JPEG");
-                        ui.add_space(12.0);
-                        ui.label("DPI");
-                        for d in [72.0, 150.0, 300.0, 600.0] {
-                            ui.selectable_value(&mut c.dpi, d, format!("{d:.0}"));
-                        }
-                    });
-                    ui.add_space(8.0);
-                }
-
-                // Выход
-                ui.horizontal(|ui| {
-                    let label = if c.mode.output_is_dir() { "Папка вывода…" } else { "Сохранить как…" };
-                    if ui.button(format!("{}  {label}", ph::EXPORT)).clicked() {
-                        let mut d = rfd::FileDialog::new();
-                        if let Some(first) = c.inputs.first() {
-                            if let Some(dir) = first.parent() {
-                                d = d.set_directory(dir);
-                            }
-                            let stem = first.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("out".into());
-                            d = match c.mode {
-                                ConvertMode::PdfToText => d.add_filter("Текст", &["txt"]).set_file_name(format!("{stem}.txt")),
-                                ConvertMode::Merge => d.add_filter("PDF", &["pdf"]).set_file_name("объединённый.pdf".to_string()),
-                                _ => d.add_filter("PDF", &["pdf"]).set_file_name(format!("{stem}.pdf")),
-                            };
-                        }
-                        c.output = if c.mode.output_is_dir() { d.pick_folder() } else { d.save_file() };
-                    }
-                    match &c.output {
-                        Some(p) => {
-                            ui.label(egui::RichText::new(p.display().to_string()).small().color(theme::muted()));
-                        }
-                        None => {
-                            ui.label(egui::RichText::new("не выбрано").small().color(theme::muted()));
-                        }
-                    }
-                });
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let ready = !c.inputs.is_empty() && c.output.is_some() && self.progress.is_none();
-                    let btn = egui::Button::new(egui::RichText::new(format!("{}  Запустить", ph::CHECK)).strong())
-                        .fill(if ready { theme::accent_dim() } else { theme::panel() })
-                        .stroke(Stroke::new(1.0, if ready { theme::accent() } else { theme::line() }))
-                        .min_size(Vec2::new(130.0, 28.0));
-                    if ui.add_enabled(ready, btn).clicked() {
-                        let out = c.output.clone().unwrap();
-                        let src = c.inputs[0].clone();
-                        run = Some(match c.mode {
-                            ConvertMode::PdfToImages => ConvertOp::PdfToImages {
-                                src,
-                                out_dir: out,
-                                format: if c.jpeg { ImageFormat::Jpeg } else { ImageFormat::Png },
-                                dpi: c.dpi,
-                            },
-                            ConvertMode::PdfToText => ConvertOp::PdfToText { src, out },
-                            ConvertMode::ImagesToPdf => ConvertOp::ImagesToPdf { srcs: c.inputs.clone(), out },
-                            ConvertMode::TextToPdf => ConvertOp::TextToPdf { src, out },
-                            ConvertMode::Merge => ConvertOp::Merge { srcs: c.inputs.clone(), out },
-                            ConvertMode::Split => ConvertOp::Split { src, out_dir: out },
-                        });
-                    }
-                    if let Some((msg, frac)) = &self.progress {
-                        ui.add(egui::ProgressBar::new(*frac).desired_width(160.0).desired_height(10.0));
-                        ui.label(egui::RichText::new(msg).small().color(theme::muted()));
-                    }
-                });
-            });
-        self.convert.open = open;
-        if let Some(op) = run {
+        if let Some(op) = self.convert.ui(ctx, self.progress.as_ref()) {
             self.progress = Some(("Запуск…".into(), 0.0));
             let _ = self.handle.job_tx.send(Job::Convert(op));
         }
@@ -2237,15 +2862,18 @@ impl ViewerApp {
                 ui.label(egui::RichText::new(format!("Страница {}", page + 1)).color(theme::muted()).small());
                 let r = ui.add(egui::TextEdit::multiline(&mut text).desired_width(340.0).desired_rows(4).hint_text("Текст заметки"));
                 r.request_focus();
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Добавить").clicked() || (ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))) {
+                    let ready = !text.trim().is_empty();
+                    let add = ui.add_enabled(ready, theme::primary_button("Добавить", ready).min_size(Vec2::new(100.0, 28.0)));
+                    if add.clicked() || (ready && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))) {
                         commit = true;
                         keep = false;
                     }
-                    if ui.button("Отмена").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if ui.add(egui::Button::new("Отмена").min_size(Vec2::new(0.0, 28.0))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         keep = false;
                     }
+                    ui.label(egui::RichText::new("Ctrl+Enter — добавить").small().color(theme::muted()));
                 });
             });
         if commit && !text.trim().is_empty() {
@@ -2260,37 +2888,71 @@ impl ViewerApp {
             return;
         }
         let mut open = true;
+        type Rows<'a> = &'a [(&'a [&'a str], &'a str)];
+        let section = |ui: &mut egui::Ui, title: &str, rows: Rows| {
+            theme::section_label(ui, title);
+            egui::Grid::new(title).num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
+                for (keys, what) in rows {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        for k in keys.iter() {
+                            theme::keycap(ui, k);
+                        }
+                    });
+                    ui.label(egui::RichText::new(*what).color(theme::muted()));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(10.0);
+        };
         egui::Window::new("Горячие клавиши")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 52.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::Grid::new("help").spacing([18.0, 4.0]).show(ui, |ui| {
-                    let rows = [
-                        ("Колесо", "прокрутка · Shift — горизонтально"),
-                        ("Ctrl+колесо", "масштаб под курсором"),
-                        ("+ / −  / 0", "масштаб / 100 %"),
-                        ("F / W", "вписать страницу / по ширине"),
-                        ("[ / ]", "повернуть вид"),
-                        ("PgUp / PgDn, ← →", "страница назад / вперёд"),
-                        ("Home / End", "первая / последняя"),
-                        ("Пробел", "экран вниз (Shift — вверх)"),
-                        ("H T P M R N G", "рука · текст · карандаш · маркер · рамка · заметка · подпись ЭП"),
-                        ("Ctrl+Z", "отменить аннотацию"),
-                        ("Ctrl+F, F3", "поиск, следующее совпадение"),
-                        ("Ctrl+O / S / Shift+S", "открыть / сохранить / сохранить как"),
-                        ("Ctrl+P", "печать"),
-                        ("Ctrl+E", "экспорт страницы в PNG"),
-                        ("ПКМ по странице", "операции со страницей"),
-                        ("Перетащить файл", "открыть · Shift+PDF — добавить · картинки — вставить"),
-                    ];
-                    for (k, v) in rows {
-                        ui.label(egui::RichText::new(k).monospace().color(theme::accent()));
-                        ui.label(egui::RichText::new(v).color(theme::muted()));
-                        ui.end_row();
-                    }
+                ui.columns(2, |cols| {
+                    section(&mut cols[0], "НАВИГАЦИЯ", &[
+                        (&["Колесо"], "прокрутка (Shift — вбок)"),
+                        (&["PgUp", "PgDn"], "страница назад / вперёд"),
+                        (&["Home", "End"], "первая / последняя"),
+                        (&["Пробел"], "экран вниз (Shift — вверх)"),
+                        (&["Ctrl", "F"], "поиск"),
+                        (&["F3"], "следующее совпадение"),
+                    ]);
+                    section(&mut cols[0], "МАСШТАБ", &[
+                        (&["Ctrl", "колесо"], "под курсором"),
+                        (&["Ctrl", "+", "−"], "крупнее / мельче"),
+                        (&["Ctrl", "0"], "вся страница"),
+                        (&["Ctrl", "1"], "100 %"),
+                        (&["Ctrl", "2"], "по ширине"),
+                        (&["[", "]"], "повернуть вид"),
+                    ]);
+                    section(&mut cols[1], "ИНСТРУМЕНТЫ", &[
+                        (&["H"], "рука"),
+                        (&["T"], "выделить текст"),
+                        (&["E"], "править текст PDF"),
+                        (&["M"], "маркер"),
+                        (&["P"], "перо"),
+                        (&["R"], "рамка"),
+                        (&["N"], "заметка"),
+                        (&["G"], "электронная подпись"),
+                        (&["Esc"], "вернуться к руке"),
+                        (&["Ctrl", "Z"], "отменить последнюю правку"),
+                    ]);
+                    section(&mut cols[1], "ФАЙЛ", &[
+                        (&["Ctrl", "O"], "открыть"),
+                        (&["Ctrl", "S"], "сохранить (+Shift — как…)"),
+                        (&["Ctrl", "P"], "печать"),
+                        (&["Ctrl", "E"], "страницу в PNG"),
+                        (&["Ctrl", "W"], "панель страниц"),
+                    ]);
                 });
+                ui.label(
+                    egui::RichText::new("Правый щелчок по странице — повернуть, вставить, переместить, удалить. Перетащите файл в окно, чтобы открыть; с Shift — добавить в конец.")
+                        .small()
+                        .color(theme::muted()),
+                );
             });
         self.show_help = open;
     }
@@ -2299,26 +2961,32 @@ impl ViewerApp {
         if !self.close_dialog {
             return;
         }
+        let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "документ".into());
         let mut choice: Option<u8> = None;
-        egui::Window::new("Несохранённые изменения")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label("Документ изменён. Сохранить перед закрытием?");
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Сохранить").clicked() {
-                        choice = Some(0);
-                    }
-                    if ui.button(egui::RichText::new("Не сохранять").color(theme::danger())).clicked() {
-                        choice = Some(1);
-                    }
-                    if ui.button("Отмена").clicked() {
+        let modal = egui::Modal::new(egui::Id::new("close_dialog")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(egui::RichText::new("Сохранить изменения?").size(17.0).strong());
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("В «{name}» есть несохранённые изменения. Без сохранения они пропадут.")).color(theme::muted()));
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                let save = ui.add(theme::primary_button("Сохранить", true).min_size(Vec2::new(110.0, 30.0)));
+                if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    choice = Some(0);
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("Не сохранять").color(theme::danger())).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                    choice = Some(1);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Отмена").min_size(Vec2::new(0.0, 30.0))).clicked() {
                         choice = Some(2);
                     }
                 });
             });
+        });
+        if choice.is_none() && modal.should_close() {
+            choice = Some(2);
+        }
         match choice {
             Some(0) => self.save(false),
             Some(1) => {
@@ -2333,6 +3001,101 @@ impl ViewerApp {
             _ => {}
         }
     }
+
+    fn dev_shot(&mut self, ctx: &egui::Context) {
+        let Some(shot) = &mut self.shot else { return };
+        shot.tick(ctx);
+        if let Some(w) = shot.window.take() {
+            match w.as_str() {
+                "convert" => self.convert.open_with(ConvertMode::Merge, self.path.iter().cloned().collect()),
+                "help" => self.show_help = true,
+                "settings" => self.show_settings = true,
+                _ => {}
+            }
+        }
+        if !self.opened {
+            return;
+        }
+        let Some(shot) = &mut self.shot else { return };
+        if let Some(t) = shot.tool.take() {
+            self.tool = match t.as_str() {
+                "pen" => Tool::Pen,
+                "marker" => Tool::Highlight,
+                "select" => Tool::Select,
+                "sign" => Tool::Sign,
+                "edit" => Tool::EditText,
+                _ => Tool::Hand,
+            };
+        }
+        if let Some(q) = shot.search.take() {
+            self.side_tab = SideTab::Search;
+            self.search_text = q;
+            self.start_search();
+        }
+        // Проверка правки текста без ввода: заменить первую строку и открыть редактор на следующей.
+        if self.tool == Tool::EditText {
+            if let Some(boxes) = self.text_boxes.get(&self.current_page).cloned() {
+                if let Some(t) = self.shot.as_mut().and_then(|s| s.text.take()) {
+                    let page = self.current_page;
+                    let mut long = boxes.iter().filter(|b| b.text.chars().count() >= 4);
+                    if let Some(b) = long.next() {
+                        self.edit(EditOp::ReplaceText { page, index: b.index, expect: b.text.clone(), text: t });
+                    }
+                    if let Some(b) = long.next() {
+                        let (x0, y0, _, _) = self.hit_rect_rotated(page, &b.rect);
+                        self.start_text_edit(page, x0 + 1.0, y0 + 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Экран, пока документ не открыт: стартовый, загрузка или ошибка.
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let name = self.opening.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string());
+        if let Some(e) = self.error.clone() {
+            let mut again = false;
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.32).max(20.0));
+                ui.label(egui::RichText::new(ph::WARNING_CIRCLE).size(42.0).color(theme::danger()));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Не удалось открыть файл").size(18.0).strong());
+                if let Some(n) = &name {
+                    ui.label(egui::RichText::new(n).color(theme::muted()));
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&e).small().color(theme::muted()));
+                ui.add_space(16.0);
+                again = ui.add(theme::primary_button(format!("{}  Открыть другой файл…", ph::FOLDER_OPEN), true).min_size(Vec2::new(220.0, 34.0))).clicked();
+            });
+            if again {
+                self.open_dialog();
+            }
+            return;
+        }
+        if self.opening.is_some() {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.4).max(20.0));
+                ui.add(egui::Spinner::new().size(28.0));
+                ui.add_space(10.0);
+                let n = name.unwrap_or_default();
+                match self.opening.as_deref().and_then(office::app_for) {
+                    Some(app) => {
+                        ui.label(egui::RichText::new(format!("{} превращает «{n}» в PDF…", app.name())).color(theme::muted()));
+                        ui.label(egui::RichText::new("Первый запуск Office может занять до минуты").small().color(theme::muted()));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new(format!("Открываю «{n}»…")).color(theme::muted()));
+                    }
+                }
+            });
+            return;
+        }
+        ui.painter().rect_filled(ui.max_rect(), 0.0, theme::panel());
+        if let Some(a) = home::home(ui, &self.store.data.recent) {
+            self.home_action(a);
+        }
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -2341,6 +3104,7 @@ impl eframe::App for ViewerApp {
     }
 
     fn on_exit(&mut self) {
+        self.remember_page();
         let others = pdfsmith_update::apply::other_instances_running();
         match self.upd.exit_action(others) {
             Some((path, relaunch)) => {
@@ -2366,6 +3130,7 @@ impl ViewerApp {
         self.def_app.poll();
         self.handle_dropped(ctx);
         self.handle_keyboard(ctx);
+        self.dev_shot(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.close_dialog {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2373,7 +3138,7 @@ impl ViewerApp {
         }
 
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(6.0, 5.0)))
+            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(8.0, 4.0)))
             .show(ctx, |ui| self.toolbar(ui));
 
         // Одна плашка за раз: обновление важнее предложения «по умолчанию».
@@ -2388,40 +3153,32 @@ impl ViewerApp {
         }
 
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(6.0, 3.0)))
+            .frame(egui::Frame::none().fill(theme::panel()).inner_margin(egui::Margin::symmetric(8.0, 3.0)))
             .show(ctx, |ui| self.status_bar(ui));
-        if self.show_sidebar {
-            egui::SidePanel::left("sidebar")
-                .exact_width(SIDEBAR_W)
+        if self.opened {
+            if self.show_sidebar {
+                egui::SidePanel::left("sidebar")
+                    .exact_width(SIDEBAR_W)
+                    .resizable(false)
+                    .frame(egui::Frame::none().fill(theme::panel()))
+                    .show(ctx, |ui| self.sidebar(ui));
+            }
+            egui::SidePanel::left("tools")
+                .exact_width(theme::RAIL_W)
                 .resizable(false)
                 .frame(egui::Frame::none().fill(theme::panel()))
-                .show(ctx, |ui| self.sidebar(ui));
+                .show(ctx, |ui| self.tool_rail(ui));
         }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::canvas()))
             .show(ctx, |ui| {
-                if let Some(e) = &self.error {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new(format!("{}  {e}", ph::WARNING)).color(theme::danger()));
-                    });
-                    return;
+                self.central = ui.max_rect();
+                if self.opened && self.error.is_none() {
+                    self.canvas(ui);
+                } else {
+                    self.empty_state(ui);
                 }
-                if !self.opened {
-                    ui.centered_and_justified(|ui| {
-                        if self.path.is_none() && self.page_sizes.is_empty() && !self.loading_page {
-                            ui.label(
-                                egui::RichText::new("Откройте PDF (Ctrl+O) или перетащите файл в окно")
-                                    .color(theme::muted())
-                                    .size(15.0),
-                            );
-                        } else {
-                            ui.spinner();
-                        }
-                    });
-                    return;
-                }
-                self.canvas(ui);
             });
 
         self.convert_window(ctx);
@@ -2431,7 +3188,46 @@ impl ViewerApp {
         self.help_window(ctx);
         self.close_window(ctx);
         crate::settings_ui::settings_window(ctx, &mut self.show_settings, &mut self.store, &mut self.upd, &mut self.def_app);
+        self.tool_hint(ctx);
+        self.toast(ctx);
+        self.drop_overlay(ctx);
     }
+}
+
+/// Сниппет результата поиска: до двух строк, найденное слово подсвечено.
+fn snippet_job(snippet: &str, query: &str, width: f32, active: bool) -> egui::text::LayoutJob {
+    let base = egui::TextFormat {
+        font_id: egui::FontId::proportional(12.5),
+        color: if active { theme::text() } else { theme::muted() },
+        ..Default::default()
+    };
+    let a = theme::accent();
+    let hl = egui::TextFormat { color: theme::text(), background: Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 70), ..base.clone() };
+    let mut job = egui::text::LayoutJob::default();
+    // Сниппет начинается с середины слова — отрезаем обрубок до первого пробела.
+    let q_at = snippet.to_lowercase().find(query).unwrap_or(usize::MAX);
+    let snippet = match snippet.find(' ') {
+        Some(sp) if sp < 16 && sp < q_at => {
+            job.append("…", 0.0, base.clone());
+            &snippet[sp + 1..]
+        }
+        _ => snippet,
+    };
+    let lower = snippet.to_lowercase();
+    let found = (!query.is_empty() && lower.len() == snippet.len())
+        .then(|| lower.find(query))
+        .flatten()
+        .filter(|&i| snippet.is_char_boundary(i) && snippet.is_char_boundary(i + query.len()));
+    match found {
+        Some(i) => {
+            job.append(&snippet[..i], 0.0, base.clone());
+            job.append(&snippet[i..i + query.len()], 0.0, hl);
+            job.append(&snippet[i + query.len()..], 0.0, base);
+        }
+        None => job.append(snippet, 0.0, base),
+    }
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: 2, break_anywhere: false, overflow_character: Some('…') };
+    job
 }
 
 fn pick_pdf() -> Option<PathBuf> {
