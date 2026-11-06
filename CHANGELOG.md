@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-06
+
 ### Добавлено
 
 - Правка текста прямо в PDF (инструмент «Правка», E): щёлкнуть по строке —
@@ -132,7 +134,8 @@
   объединение и разделение PDF.
 - Перетаскивание файлов для открытия и вставки страниц.
 
-[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/denfry/pdfsmith/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/denfry/pdfsmith/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/denfry/pdfsmith/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/denfry/pdfsmith/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/denfry/pdfsmith/compare/v0.1.2...v0.1.3
